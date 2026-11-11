@@ -12,12 +12,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/buchgr/bazel-remote/cache"
-	"github.com/buchgr/bazel-remote/cache/disk/casblob"
+	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
 
-	"github.com/klauspost/compress/zstd"
-
-	"github.com/buchgr/bazel-remote/utils/zstdpool"
+	"github.com/buchgr/bazel-remote/v2/utils/zstdpool"
 	syncpool "github.com/mostynb/zstdpool-syncpool"
 )
 
@@ -33,8 +31,19 @@ var decoderPool = zstdpool.GetDecoderPool()
 
 var emptyZstdBlob = []byte{40, 181, 47, 253, 32, 0, 1, 0, 0}
 
+var (
+	errNilReadRequest = status.Error(codes.InvalidArgument,
+		"expected a non-nil *bytestream.ReadRequest")
+	errNilQueryWriteStatusRequest = status.Error(codes.InvalidArgument,
+		"expected a non-nil *bytestream.QueryWriteStatusRequest")
+)
+
 func (s *grpcServer) Read(req *bytestream.ReadRequest,
 	resp bytestream.ByteStream_ReadServer) error {
+
+	if req == nil {
+		return errNilReadRequest
+	}
 
 	errorPrefix := "GRPC BYTESTREAM READ"
 
@@ -102,7 +111,7 @@ func (s *grpcServer) Read(req *bytestream.ReadRequest,
 	}
 
 	if rc != nil {
-		defer rc.Close()
+		defer func() { _ = rc.Close() }()
 	}
 
 	if err != nil {
@@ -348,13 +357,6 @@ var errDecoderPoolFail error = errors.New("failed to get DecoderWrapper from poo
 
 func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 
-	if s.checkClientCertForWrites {
-		err := checkGRPCClientCert(srv.Context())
-		if err != nil {
-			return err
-		}
-	}
-
 	var resp bytestream.WriteResponse
 	pr, pw := io.Pipe()
 
@@ -363,12 +365,6 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 	resourceNameChan := make(chan string, 1)
 
 	cmp := casblob.Identity
-	var dec *zstd.Decoder
-	defer func() {
-		if dec != nil {
-			dec.Close()
-		}
-	}()
 
 	go func() {
 		firstIteration := true
@@ -412,10 +408,21 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 					return
 				}
 
+				if size > s.maxCasBlobSizeBytes {
+					recvResult <- status.Errorf(codes.InvalidArgument,
+						"Blob size %d exceeds maximum allowed size %d",
+						size, s.maxCasBlobSizeBytes)
+					return
+				}
+
 				exists, _ := s.cache.Contains(srv.Context(), cache.CAS, hash, size)
 				if exists {
 					// Blob already exists, return without writing anything.
-					resp.CommittedSize = size
+					if cmp == casblob.Identity {
+						resp.CommittedSize = size
+					} else {
+						resp.CommittedSize = -1
+					}
 					putResult <- io.EOF
 					return
 				}
@@ -446,7 +453,8 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 				}
 
 				go func() {
-					err := s.cache.Put(cache.CAS, hash, size, rc)
+					defer func() { _ = rc.Close() }()
+					err := s.cache.Put(srv.Context(), cache.CAS, hash, size, rc)
 					putResult <- err
 				}()
 
@@ -504,7 +512,7 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 			return status.Error(codes.Internal, msg)
 		}
 		if err == io.EOF {
-			pw.Close()
+			_ = pw.Close()
 			break
 		}
 		if err != nil {
@@ -536,6 +544,7 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 			}
 			return nil
 		}
+
 		if err == nil {
 			// Unexpected early return. Should not happen.
 			msg := fmt.Sprintf("GRPC BYTESTREAM WRITE INTERNAL ERROR %s", resourceName)
@@ -544,8 +553,8 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 		}
 
 		msg := fmt.Sprintf("GRPC BYTESTREAM WRITE CACHE ERROR: %s %v", resourceName, err)
-		s.accessLogger.Printf(msg)
-		return status.Error(codes.Internal, msg)
+		s.logErrorPrintf(srv.Context(), err, "%s", msg)
+		return status.Error(gRPCErrCode(err, codes.Internal), msg)
 	}
 
 	select {
@@ -583,7 +592,25 @@ func (s *grpcServer) Write(srv bytestream.ByteStream_WriteServer) error {
 	return nil
 }
 
-func (s *grpcServer) QueryWriteStatus(context.Context, *bytestream.QueryWriteStatusRequest) (*bytestream.QueryWriteStatusResponse, error) {
-	return nil, status.Error(codes.Unimplemented,
-		"QueryWriteStatus is not implemented")
+func (s *grpcServer) QueryWriteStatus(ctx context.Context, req *bytestream.QueryWriteStatusRequest) (*bytestream.QueryWriteStatusResponse, error) {
+
+	if req == nil {
+		return nil, errNilQueryWriteStatusRequest
+	}
+
+	hash, size, _, err := s.parseWriteResource(req.ResourceName)
+	if err != nil {
+		return nil, err
+	}
+
+	// We don't support partial writes, so the status will either be fully written
+	// and complete, or 0 written and incomplete.
+
+	exists, _ := s.cache.Contains(ctx, cache.CAS, hash, size)
+
+	if !exists {
+		return &bytestream.QueryWriteStatusResponse{CommittedSize: 0, Complete: false}, nil
+	}
+
+	return &bytestream.QueryWriteStatusResponse{CommittedSize: size, Complete: true}, nil
 }

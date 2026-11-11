@@ -2,6 +2,7 @@ package tempfile
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"sync"
@@ -23,7 +24,7 @@ func NewCreator() *Creator {
 // Fast "quick and dirty" linear congruential (pseudo-random) number
 // generator from Numerical Recipes. Excerpt here:
 // https://www.unf.edu/~cwinton/html/cop4300/s09/class.notes/LCGinfo.pdf
-// This is the same algorithm as used in the ioutil.TempFile go standard
+// This is the same algorithm as used in the old ioutil.TempFile go standard
 // library function.
 func (c *Creator) ranqd1() string {
 	c.mu.Lock()
@@ -35,20 +36,14 @@ func (c *Creator) ranqd1() string {
 
 const flags = os.O_RDWR | os.O_CREATE | os.O_EXCL
 
-const EndMode = 0666
-const wipMode = EndMode | os.ModeSetgid
+const mode = 0664
 
-var errNoTempfile = errors.New("Failed to create a temp file")
+var errNoTempfile = errors.New("failed to create a temp file")
 
 // Create attempts to create a file whose name is of the form
 // <base>-<randomstring> and with a ".v1" suffix if `legacy` is
-// true. The file will be created with the setgid bit set, which
-// indicates that it is not complete. The *os.File is returned
-// along with the random string, and an error if something went
-// wrong.
-//
-// Once the file has been successfully written by the caller, it
-// should be chmod'ed to `EndMode` to mark it as complete.
+// true. The *os.File is returned along with the random string,
+// and an error if something went wrong.
 func (c *Creator) Create(base string, legacy bool) (*os.File, string, error) {
 	var err error
 	var f *os.File
@@ -63,7 +58,7 @@ func (c *Creator) Create(base string, legacy bool) (*os.File, string, error) {
 			name = base + "-" + random
 		}
 
-		f, err = os.OpenFile(name, flags, wipMode)
+		f, err = os.OpenFile(name, flags, mode)
 		if err == nil {
 			return f, random, nil
 		}
@@ -73,7 +68,8 @@ func (c *Creator) Create(base string, legacy bool) (*os.File, string, error) {
 		}
 
 		// Unexpected error.
-		return nil, "", err
+		return nil, "", fmt.Errorf("unexpected error opening temp file: %w", err)
 	}
+
 	return nil, "", errNoTempfile
 }

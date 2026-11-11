@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -17,10 +16,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/buchgr/bazel-remote/cache"
-	"github.com/buchgr/bazel-remote/cache/disk"
-	"github.com/buchgr/bazel-remote/cache/disk/casblob"
-	testutils "github.com/buchgr/bazel-remote/utils"
+	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache/disk"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/zstdimpl"
+	testutils "github.com/buchgr/bazel-remote/v2/utils"
 )
 
 type testServer struct {
@@ -37,15 +37,18 @@ func (s *testServer) handler(w http.ResponseWriter, r *http.Request) {
 
 	kind := fields[1]
 	var kindMap map[string][]byte
-	if kind == "ac" {
+
+	switch kind {
+	case "ac":
 		kindMap = s.ac
-	} else if kind == "cas.v2" {
+	case "cas.v2":
 		kindMap = s.cas
-	} else {
+	default:
 		msg := fmt.Sprintf("unsupported URL: %q", r.URL.Path)
 		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
+
 	hash := fields[2]
 
 	s.mu.Lock()
@@ -62,7 +65,7 @@ func (s *testServer) handler(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case http.MethodPut:
-		data, err := ioutil.ReadAll(r.Body)
+		data, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "failed to read body", http.StatusInternalServerError)
 			return
@@ -99,7 +102,7 @@ func TestEverything(t *testing.T) {
 	defer s.srv.Close()
 
 	cacheDir := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir)
+	defer func() { _ = os.RemoveAll(cacheDir) }()
 
 	logFlags := log.Ldate | log.Ltime | log.LUTC
 	accessLogger := log.New(os.Stdout, "", logFlags)
@@ -129,7 +132,7 @@ func TestEverything(t *testing.T) {
 
 	// PUT two different values with the same key in ac and cas.
 
-	err = diskCache.Put(cache.AC, hash, int64(len(acData)), bytes.NewReader(acData))
+	err = diskCache.Put(ctx, cache.AC, hash, int64(len(acData)), bytes.NewReader(acData))
 	if err != nil {
 		t.Error(err)
 	}
@@ -146,7 +149,7 @@ func TestEverything(t *testing.T) {
 	}
 	s.mu.Unlock()
 
-	err = diskCache.Put(cache.CAS, hash, int64(len(casData)), bytes.NewReader(casData))
+	err = diskCache.Put(ctx, cache.CAS, hash, int64(len(casData)), bytes.NewReader(casData))
 	if err != nil {
 		t.Error(err)
 	}
@@ -172,12 +175,12 @@ func TestEverything(t *testing.T) {
 
 		// TODO: tweak the GetUncompressedReadCloser API to accept more than os.File.
 
-		tmpfile, err := ioutil.TempFile("", "bazel-remote-httpproxy-test")
+		tmpfile, err := os.CreateTemp("", "bazel-remote-httpproxy-test")
 		if err != nil {
 			t.Fatal(err)
 		}
 		tfn := tmpfile.Name()
-		defer os.Remove(tfn)
+		defer func() { _ = os.Remove(tfn) }()
 
 		_, err = io.Copy(tmpfile, bytes.NewReader(v))
 		if err != nil {
@@ -187,14 +190,21 @@ func TestEverything(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer os.Remove(tmpfile2.Name())
+		defer func() { _ = os.Remove(tmpfile2.Name()) }()
 
-		rc, err := casblob.GetUncompressedReadCloser(tmpfile2, int64(len(casData)), 0)
+		var zi zstdimpl.ZstdImpl
+		zi, err = zstdimpl.Get("go")
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer rc.Close()
-		vData, err := ioutil.ReadAll(rc)
+
+		rc, err := casblob.GetUncompressedReadCloser(
+			zi, tmpfile2, int64(len(casData)), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = rc.Close() }()
+		vData, err := io.ReadAll(rc)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -244,7 +254,7 @@ func TestEverything(t *testing.T) {
 			len(acData), size)
 	}
 
-	data, err = ioutil.ReadAll(rc)
+	data, err = io.ReadAll(rc)
 	if err != nil {
 		t.Error(err)
 	}
@@ -252,7 +262,7 @@ func TestEverything(t *testing.T) {
 	if !bytes.Equal(data, acData) {
 		t.Error("Different AC data returned")
 	}
-	rc.Close()
+	_ = rc.Close()
 
 	rc, size, err = diskCache.Get(ctx, cache.CAS, hash, int64(len(casData)), 0)
 	if err != nil {
@@ -264,7 +274,7 @@ func TestEverything(t *testing.T) {
 			len(casData), size)
 	}
 
-	data, err = ioutil.ReadAll(rc)
+	data, err = io.ReadAll(rc)
 	if err != nil {
 		t.Error(err)
 	}
@@ -272,13 +282,13 @@ func TestEverything(t *testing.T) {
 	if !bytes.Equal(data, casData) {
 		t.Error("Different CAS data returned")
 	}
-	rc.Close()
+	_ = rc.Close()
 
 	// Create a new empty cache, and check that we can fill it
 	// from the backend.
 
 	cacheDir2 := testutils.TempDir(t)
-	defer os.RemoveAll(cacheDir2)
+	defer func() { _ = os.RemoveAll(cacheDir2) }()
 
 	diskCache, err = disk.New(cacheDir2, diskCacheSize, disk.WithProxyBackend(proxyCache), disk.WithAccessLogger(testutils.NewSilentLogger()))
 	if err != nil {
@@ -322,7 +332,7 @@ func TestEverything(t *testing.T) {
 			len(acData), size)
 	}
 
-	data, err = ioutil.ReadAll(rc)
+	data, err = io.ReadAll(rc)
 	if err != nil {
 		t.Error(err)
 	}
@@ -330,7 +340,7 @@ func TestEverything(t *testing.T) {
 	if !bytes.Equal(data, acData) {
 		t.Error("Different AC data returned")
 	}
-	rc.Close()
+	_ = rc.Close()
 
 	rc, size, err = diskCache.Get(ctx, cache.CAS, hash, int64(len(casData)), 0)
 	if err != nil {
@@ -342,7 +352,7 @@ func TestEverything(t *testing.T) {
 			len(casData), size)
 	}
 
-	data, err = ioutil.ReadAll(rc)
+	data, err = io.ReadAll(rc)
 	if err != nil {
 		t.Error(err)
 	}
@@ -350,5 +360,5 @@ func TestEverything(t *testing.T) {
 	if !bytes.Equal(data, casData) {
 		t.Error("Different CAS data returned")
 	}
-	rc.Close()
+	_ = rc.Close()
 }

@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 script_dir=$(dirname "${BASH_SOURCE[0]}")
 cd "${script_dir}/.."
@@ -24,16 +25,35 @@ then
 fi
 
 # push test-amd64 and test-arm64 images.
+if [ "$(uname -p)" = aarch64 ]
+then
+	bazel run //:push_to_dockerhub_arm64
+
+	# Check that the image works, at least well enough to print help, and with cgo support.
+	docker pull docker.io/buchgr/bazel-remote-cache:tmp-arm64
+	docker run docker.io/buchgr/bazel-remote-cache:tmp-arm64 -h
+	docker run docker.io/buchgr/bazel-remote-cache:tmp-arm64 -h | grep zstd_implementation | grep '"cgo"'
+
+	exit 0
+fi
 bazel run //:push_to_dockerhub_amd64
-bazel run //:push_to_dockerhub_arm64
+
+# Check that the image works, at least well enough to print help, and with cgo support.
+docker pull docker.io/buchgr/bazel-remote-cache:tmp-amd64
+docker run docker.io/buchgr/bazel-remote-cache:tmp-amd64 -h
+docker run docker.io/buchgr/bazel-remote-cache:tmp-amd64 -h | grep zstd_implementation | grep '"cgo"'
 
 # Create the multiarch manifest.
-docker manifest rm buchgr/bazel-remote-cache:$tag
+docker manifest rm buchgr/bazel-remote-cache:$tag || true
 docker manifest create buchgr/bazel-remote-cache:$tag \
     --amend buchgr/bazel-remote-cache:tmp-amd64 \
     --amend buchgr/bazel-remote-cache:tmp-arm64
 
 # Push the multiarch manifest
 docker manifest push buchgr/bazel-remote-cache:$tag
+
+# Mirror to quay.io (using https://github.com/regclient/regclient):
+regctl image copy docker.io/buchgr/bazel-remote-cache:$tag \
+	quay.io/bazel-remote/bazel-remote:$tag
 
 echo "Go ahead and delete the tmp-amd64 and tmp-arm64 images from the web ui"

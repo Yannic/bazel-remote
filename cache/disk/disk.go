@@ -2,32 +2,35 @@ package disk
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
-	"math"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
-	"runtime"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/buchgr/bazel-remote/cache"
-	"github.com/buchgr/bazel-remote/cache/disk/casblob"
-	"github.com/buchgr/bazel-remote/utils/tempfile"
+	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/zstdimpl"
+	"github.com/buchgr/bazel-remote/v2/utils/annotate"
+	"github.com/buchgr/bazel-remote/v2/utils/sha256verifier"
+	"github.com/buchgr/bazel-remote/v2/utils/tempfile"
+	"github.com/buchgr/bazel-remote/v2/utils/validate"
 
 	"github.com/djherbis/atime"
 
-	pb "github.com/buchgr/bazel-remote/genproto/build/bazel/remote/execution/v2"
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"golang.org/x/sync/semaphore"
 )
@@ -36,13 +39,11 @@ var tfc = tempfile.NewCreator()
 
 var emptyZstdBlob = []byte{40, 181, 47, 253, 32, 0, 1, 0, 0}
 
-var hashKeyRegex = regexp.MustCompile("^[a-f0-9]{64}$")
-
 type Cache interface {
 	Get(ctx context.Context, kind cache.EntryKind, hash string, size int64, offset int64) (io.ReadCloser, int64, error)
 	GetValidatedActionResult(ctx context.Context, hash string) (*pb.ActionResult, []byte, error)
 	GetZstd(ctx context.Context, hash string, size int64, offset int64) (io.ReadCloser, int64, error)
-	Put(kind cache.EntryKind, hash string, size int64, r io.Reader) error
+	Put(ctx context.Context, kind cache.EntryKind, hash string, size int64, r io.Reader) error
 	Contains(ctx context.Context, kind cache.EntryKind, hash string, size int64) (bool, int64)
 	FindMissingCasBlobs(ctx context.Context, blobs []*pb.Digest) ([]*pb.Digest, error)
 
@@ -70,23 +71,26 @@ type lruItem struct {
 // diskCache is a filesystem-based LRU cache, with an optional backend proxy.
 // It is safe for concurrent use.
 type diskCache struct {
-	dir           string
-	proxy         cache.Proxy
-	storageMode   casblob.CompressionType
-	maxBlobSize   int64
-	accessLogger  *log.Logger
-	containsQueue chan proxyCheck
+	dir              string
+	proxy            cache.Proxy
+	storageMode      casblob.CompressionType
+	zstd             zstdimpl.ZstdImpl
+	maxBlobSize      int64
+	maxProxyBlobSize int64
+	accessLogger     *log.Logger
+	containsQueue    chan proxyCheck
 
-	// Limit the number of simultaneous file removals.
-	fileRemovalSem *semaphore.Weighted
+	// Limit the number of simultaneous file removals and filesystem write
+	// operations (apart from atime updates, which we hope are fast).
+	// When acquiring both the "diskWaitSem" semaphore and the "mu" mutex,
+	// the "diskWaitSem" must be acquired before "mu" in order to avoid
+	// potential deadlocks.
+	diskWaitSem *semaphore.Weighted
 
 	mu  sync.Mutex
 	lru SizedLRU
-}
 
-type nameAndInfo struct {
-	name string // relative path
-	info os.FileInfo
+	gaugeCacheAge prometheus.Gauge
 }
 
 const sha256HashStrSize = sha256.Size * 2 // Two hex characters per byte.
@@ -106,118 +110,89 @@ func badReqErr(format string, a ...interface{}) *cache.Error {
 	}
 }
 
-// New returns a new instance of a filesystem-based cache rooted at `dir`,
-// with a maximum size of `maxSizeBytes` bytes and `opts` Options set.
-func New(dir string, maxSizeBytes int64, opts ...Option) (Cache, error) {
-
-	err := os.MkdirAll(dir, os.ModePerm)
-	if err != nil {
-		return nil, err
-	}
-
-	dir, err = filepath.EvalSymlinks(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	c := diskCache{
-		dir: dir,
-
-		// Not using config here, to avoid test import cycles.
-		storageMode: casblob.Zstandard,
-		maxBlobSize: math.MaxInt64,
-
-		// Go defaults to a limit of 10,000 operating system threads.
-		// We probably don't need half of those for file removals at
-		// any given point in time, unless the disk/fs can't keep up.
-		// I suppose it's better to slow down processing than to crash
-		// when hitting the 10k limit or to run out of disk space.
-		fileRemovalSem: semaphore.NewWeighted(5000),
-	}
-
-	cc := CacheConfig{diskCache: &c}
-
-	// The eviction callback deletes the file from disk.
-	// This function is only called while the lock is held
-	// by the current goroutine.
-	onEvict := func(key Key, value lruItem) {
-		ks := key.(string)
-		hash := ks[len(ks)-sha256.Size*2:]
-		var kind cache.EntryKind = cache.AC
-		if strings.HasPrefix(ks, "cas") {
-			kind = cache.CAS
-		} else if strings.HasPrefix(ks, "ac") {
-			kind = cache.AC
-		} else if strings.HasPrefix(ks, "raw") {
-			kind = cache.RAW
-		}
-
-		f := filepath.Join(dir, c.FileLocation(kind, value.legacy, hash, value.size, value.random))
-
-		// Run in a goroutine so we can release the lock sooner.
-		go c.removeFile(f)
-	}
-
-	c.lru = NewSizedLRU(maxSizeBytes, onEvict)
-
-	// Apply options.
-	for _, o := range opts {
-		err = o(&cc)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Create the directory structure.
-	hexLetters := []byte("0123456789abcdef")
-	for _, c1 := range hexLetters {
-		for _, c2 := range hexLetters {
-			subDir := string(c1) + string(c2)
-			err := os.MkdirAll(filepath.Join(dir, cache.CAS.DirName(), subDir), os.ModePerm)
-			if err != nil {
-				return nil, err
-			}
-			err = os.MkdirAll(filepath.Join(dir, cache.AC.DirName(), subDir), os.ModePerm)
-			if err != nil {
-				return nil, err
-			}
-			err = os.MkdirAll(filepath.Join(dir, cache.RAW.DirName(), subDir), os.ModePerm)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	err = c.migrateDirectories()
-	if err != nil {
-		return nil, fmt.Errorf("Attempting to migrate the old directory structure failed: %w", err)
-	}
-	err = c.loadExistingFiles()
-	if err != nil {
-		return nil, fmt.Errorf("Loading of existing cache entries failed due to error: %w", err)
-	}
-
-	if cc.metrics == nil {
-		return &c, nil
-	}
-
-	cc.metrics.diskCache = &c
-
-	return cc.metrics, nil
-}
-
 // Non-test users must call this to expose metrics.
 func (c *diskCache) RegisterMetrics() {
 	c.lru.RegisterMetrics()
+
+	prometheus.MustRegister(c.gaugeCacheAge)
+
+	// Update the cache age metric on a static interval
+	// Note: this could be modeled as a GuageFunc that updates as needed
+	// but since the updater func must lock the cache mu, it was deemed
+	// necessary to have greater control of when to get the cache age
+	go c.pollCacheAge()
+
+	go c.shiftMetricPeriodContinuously()
+}
+
+// Shift to new period for metrics every 30 seconds. A period of
+// 30 seconds should give margin to catch all peaks (with for example
+// a 10 second scrape interval) even in cases of delayed or missed
+// scrapes from prometheus.
+func (c *diskCache) shiftMetricPeriodContinuously() {
+	ticker := time.NewTicker(30 * time.Second)
+	for range ticker.C {
+		c.mu.Lock()
+		c.lru.shiftToNextMetricPeriod()
+		c.mu.Unlock()
+	}
+}
+
+// Update metric every minute with the idle time of the least recently used item in the cache
+func (c *diskCache) pollCacheAge() {
+	ticker := time.NewTicker(60 * time.Second)
+	for ; true; <-ticker.C {
+		c.updateCacheAgeMetric()
+	}
+}
+
+// Get the idle time of the least-recently used item in the cache, and store the value in a metric
+func (c *diskCache) updateCacheAgeMetric() {
+	c.mu.Lock()
+
+	key, value, ok := c.lru.getTailItem()
+	if !ok {
+		// No items in the cache.
+		c.mu.Unlock()
+		return
+	}
+
+	age := 0.0
+	validAge := true
+
+	f := c.getElementPath(key, value)
+	ts, err := atime.Stat(f)
+
+	if err != nil {
+		log.Printf("ERROR: failed to determine time of least recently used cache item: %v, unable to stat %s", err, f)
+		validAge = false
+	} else {
+		age = time.Since(ts).Seconds()
+	}
+
+	c.mu.Unlock()
+
+	if validAge {
+		c.gaugeCacheAge.Set(age)
+	}
+}
+
+func (c *diskCache) getElementPath(key string, value lruItem) string {
+	ks := key
+	hash := ks[len(ks)-sha256.Size*2:]
+	var kind = cache.AC
+	if strings.HasPrefix(ks, "cas") {
+		kind = cache.CAS
+	} else if strings.HasPrefix(ks, "ac") {
+		kind = cache.AC
+	} else if strings.HasPrefix(ks, "raw") {
+		kind = cache.RAW
+	}
+
+	return filepath.Join(c.dir, c.FileLocation(kind, value.legacy, hash, value.size, value.random))
 }
 
 func (c *diskCache) removeFile(f string) {
-	if err := c.fileRemovalSem.Acquire(context.Background(), 1); err != nil {
-		log.Printf("ERROR: failed to aquire semaphore: %v, unable to remove %s", err, f)
-		return
-	}
-	defer c.fileRemovalSem.Release(1)
-
 	err := os.Remove(f)
 	if err != nil {
 		log.Printf("ERROR: failed to remove evicted cache file: %s", f)
@@ -256,288 +231,14 @@ func (c *diskCache) FileLocation(kind cache.EntryKind, legacy bool, hash string,
 	return fmt.Sprintf("cas.v2/%s/%s-%d-%s", hash[:2], hash, size, random)
 }
 
-func (c *diskCache) migrateDirectories() error {
-	err := migrateDirectory(c.dir, cache.AC)
-	if err != nil {
-		return err
-	}
-	err = migrateDirectory(c.dir, cache.CAS)
-	if err != nil {
-		return err
-	}
-	err = migrateDirectory(c.dir, cache.RAW)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func migrateDirectory(baseDir string, kind cache.EntryKind) error {
-	sourceDir := path.Join(baseDir, kind.String())
-
-	_, err := os.Stat(sourceDir)
-	if os.IsNotExist(err) {
-		return nil
-	}
-
-	log.Println("Migrating files (if any) to new directory structure:", sourceDir)
-
-	listing, err := ioutil.ReadDir(sourceDir)
-	if err != nil {
-		return err
-	}
-
-	// The v0 directory structure was lowercase sha256 hash filenames
-	// stored directly in the ac/ and cas/ directories.
-
-	// The v1 directory structure has subdirs for each two lowercase
-	// hex character pairs.
-	v1DirRegex := regexp.MustCompile("^[a-f0-9]{2}$")
-
-	targetDir := path.Join(baseDir, kind.DirName())
-
-	itemChan := make(chan os.FileInfo)
-	errChan := make(chan error)
-
-	var wg sync.WaitGroup
-	for i := 0; i < runtime.NumCPU(); i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			for item := range itemChan {
-
-				oldName := item.Name()
-				oldNamePath := filepath.Join(sourceDir, oldName)
-
-				if item.IsDir() {
-					if !v1DirRegex.MatchString(oldName) {
-						// Warn about non-v1 subdirectories.
-						log.Println("Warning: unexpected directory", oldNamePath)
-					}
-
-					destDir := filepath.Join(targetDir, oldName[:2])
-					err := migrateV1Subdir(oldNamePath, destDir, kind)
-					if err != nil {
-						log.Printf("Warning: failed to read subdir %q: %s",
-							oldNamePath, err)
-						continue
-					}
-
-					continue
-				}
-
-				if !item.Mode().IsRegular() {
-					log.Println("Warning: skipping non-regular file:", oldNamePath)
-					continue
-				}
-
-				if !hashKeyRegex.MatchString(oldName) {
-					log.Println("Warning: skipping unexpected file:", oldNamePath)
-					continue
-				}
-
-				src := filepath.Join(sourceDir, oldName)
-
-				// Add a not-so-random "random" string. This should be OK
-				// since there is probably only be one file for this hash.
-				dest := filepath.Join(targetDir, oldName[:2], oldName+"-222444666")
-				if kind == cache.CAS {
-					dest += ".v1"
-				}
-
-				// TODO: make this work across filesystems?
-				err := os.Rename(src, dest)
-				if err != nil {
-					errChan <- err
-					return
-				}
-			}
-		}()
-	}
-
-	err = nil
-	numItems := len(listing)
-	i := 1
-	for _, item := range listing {
-		select {
-		case itemChan <- item:
-			log.Printf("Migrating %s item(s) %d/%d, %s\n", sourceDir, i, numItems, item.Name())
-			i++
-		case err = <-errChan:
-			log.Println("Encountered error while migrating files:", err)
-			close(itemChan)
-		}
-	}
-	close(itemChan)
-	wg.Wait()
-
-	if err != nil {
-		return err
-	}
-
-	// Remove the empty directories.
-	return os.RemoveAll(sourceDir)
-}
-
-func migrateV1Subdir(oldDir string, destDir string, kind cache.EntryKind) error {
-	listing, err := ioutil.ReadDir(oldDir)
-	if err != nil {
-		return err
-	}
-
-	if kind == cache.CAS {
-		for _, item := range listing {
-
-			oldPath := path.Join(oldDir, item.Name())
-
-			if !hashKeyRegex.MatchString(item.Name()) {
-				return fmt.Errorf("Unexpected file: %s", oldPath)
-			}
-
-			destPath := path.Join(destDir, item.Name()) + "-556677.v1"
-			err = os.Rename(oldPath, destPath)
-			if err != nil {
-				return fmt.Errorf("Failed to migrate CAS blob %s: %w",
-					oldPath, err)
-			}
-		}
-
-		return os.Remove(oldDir)
-	}
-
-	for _, item := range listing {
-		oldPath := path.Join(oldDir, item.Name())
-
-		if !hashKeyRegex.MatchString(item.Name()) {
-			return fmt.Errorf("Unexpected file: %s %s", oldPath, item.Name())
-		}
-
-		destPath := path.Join(destDir, item.Name()) + "-112233"
-
-		// TODO: support cross-filesystem migration.
-		err = os.Rename(oldPath, destPath)
-		if err != nil {
-			return fmt.Errorf("Failed to migrate blob %s: %w", oldPath, err)
-		}
-	}
-
-	return nil
-}
-
-// loadExistingFiles lists all files in the cache directory, and adds them to the
-// LRU index so that they can be served. Files are sorted by access time first,
-// so that the eviction behavior is preserved across server restarts.
-func (c *diskCache) loadExistingFiles() error {
-	log.Printf("Loading existing files in %s.\n", c.dir)
-
-	// compressed CAS items: <hash>-<logical size>-<random digits/ascii letters>
-	// uncompressed CAS items: <hash>-<logical size>-<random digits/ascii letters>.v1
-	// AC and RAW items: <hash>-<random digits/ascii letters>
-	re := regexp.MustCompile(`^([a-f0-9]{64})(?:-([1-9][0-9]*))?-([0-9a-zA-Z]+)(\.v1)?$`)
-
-	// Walk the directory tree
-	var files []nameAndInfo
-	err := filepath.Walk(c.dir, func(name string, info os.FileInfo, err error) error {
-		if err != nil {
-			log.Println("Error while walking directory:", err)
-			return err
-		}
-
-		if info.IsDir() {
-			return nil
-		}
-
-		if info.Mode()&os.ModeSetgid == os.ModeSetgid {
-			log.Println("Removing incomplete file:", name)
-			os.Remove(name)
-		} else {
-			files = append(files, nameAndInfo{name: name, info: info})
-		}
-
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	log.Println("Sorting cache files by atime.")
-	// Sort in increasing order of atime
-	sort.Slice(files, func(i int, j int) bool {
-		return atime.Get(files[i].info).Before(atime.Get(files[j].info))
-	})
-
-	log.Println("Building LRU index.")
-	for _, f := range files {
-		relPath := f.name[len(c.dir)+1:]
-
-		fields := strings.Split(relPath, "/")
-
-		file := fields[len(fields)-1]
-
-		sm := re.FindStringSubmatch(file)
-
-		if len(sm) != 5 {
-			return fmt.Errorf("Unrecognized file: %q", relPath)
-		}
-
-		hash := sm[1]
-
-		sizeOnDisk := f.info.Size()
-		size := sizeOnDisk
-		if len(sm[2]) > 0 {
-			size, err = strconv.ParseInt(sm[2], 10, 64)
-			if err != nil {
-				return fmt.Errorf("Failed to parse int from %q: %w", sm[2], err)
-			}
-		}
-
-		random := sm[3]
-		if len(random) == 0 {
-			return fmt.Errorf("Unrecognized file (no random string): %q", file)
-		}
-
-		legacy := sm[4] == ".v1"
-
-		var lookupKey string
-
-		if strings.HasPrefix(relPath, "cas.v2/") {
-			lookupKey = "cas/" + hash
-		} else if strings.HasPrefix(relPath, "ac.v2/") {
-			lookupKey = "ac/" + hash
-		} else if strings.HasPrefix(relPath, "raw.v2/") {
-			lookupKey = "raw/" + hash
-		} else {
-			return fmt.Errorf("Unrecognised file in cache dir: %q", relPath)
-		}
-
-		ok := c.lru.Add(lookupKey, lruItem{
-			size:       size,
-			sizeOnDisk: sizeOnDisk,
-			legacy:     legacy,
-			random:     random,
-		})
-		if !ok {
-			err = os.Remove(filepath.Join(c.dir, relPath))
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	log.Println("Finished loading disk cache files.")
-
-	return nil
-}
-
 // Put stores a stream of `size` bytes from `r` into the cache.
 // If `hash` is not the empty string, and the contents don't match it,
 // a non-nil error is returned. All data will be read from `r` before
 // this function returns.
-func (c *diskCache) Put(kind cache.EntryKind, hash string, size int64, r io.Reader) (rErr error) {
+func (c *diskCache) Put(ctx context.Context, kind cache.EntryKind, hash string, size int64, r io.Reader) (rErr error) {
 	defer func() {
 		if r != nil {
-			_, _ = io.Copy(ioutil.Discard, r)
+			_, _ = io.Copy(io.Discard, r)
 		}
 	}()
 
@@ -559,6 +260,16 @@ func (c *diskCache) Put(kind cache.EntryKind, hash string, size int64, r io.Read
 		return nil
 	}
 
+	// Put requests are processed using blocking file syscalls, which
+	// consume one operating system thread per request. We throttle
+	// these requests with a semaphore to avoid creating too many
+	// operating system threads.
+	if err := c.diskWaitSem.Acquire(context.Background(), 1); err != nil {
+		log.Printf("ERROR: failed to acquire semaphore: %v", err)
+		return internalErr(err)
+	}
+	defer c.diskWaitSem.Release(1)
+
 	key := cache.LookupKey(kind, hash)
 
 	var tf *os.File // Tempfile.
@@ -571,12 +282,9 @@ func (c *diskCache) Put(kind cache.EntryKind, hash string, size int64, r io.Read
 	defer func() {
 		// No lock required to remove stray tempfiles.
 		if removeTempfile {
-			os.Remove(blobFile)
-		} else if blobFile != "" {
-			// Mark the file as "complete".
-			err := os.Chmod(blobFile, tempfile.EndMode)
+			err := os.Remove(blobFile)
 			if err != nil {
-				log.Println("Failed to mark", blobFile, "as complete:", err)
+				log.Printf("warning: failed to remove temp file: %q", blobFile)
 			}
 		}
 
@@ -594,18 +302,10 @@ func (c *diskCache) Put(kind cache.EntryKind, hash string, size int64, r io.Read
 
 	if size > 0 {
 		c.mu.Lock()
-		ok, err := c.lru.Reserve(size)
+		err := c.lru.Reserve(size)
 		if err != nil {
 			c.mu.Unlock()
-			return internalErr(err)
-		}
-		if !ok {
-			c.mu.Unlock()
-			return &cache.Error{
-				Code: http.StatusInsufficientStorage,
-				Text: fmt.Sprintf("The item (%d) + reserved space is larger than the cache's maximum size (%d).",
-					size, c.lru.MaxSize()),
-			}
+			return err
 		}
 		c.mu.Unlock()
 		unreserve = true
@@ -631,7 +331,7 @@ func (c *diskCache) Put(kind cache.EntryKind, hash string, size int64, r io.Read
 	removeTempfile = true
 
 	var sizeOnDisk int64
-	sizeOnDisk, err = c.writeAndCloseFile(r, kind, hash, size, tf)
+	sizeOnDisk, err = c.writeAndCloseFile(ctx, r, kind, hash, size, tf)
 	if err != nil {
 		return internalErr(err)
 	}
@@ -644,7 +344,7 @@ func (c *diskCache) Put(kind cache.EntryKind, hash string, size int64, r io.Read
 			log.Println("Failed to proxy Put:", err)
 		} else {
 			// Doesn't block, should be fast.
-			c.proxy.Put(kind, hash, sizeOnDisk, rc)
+			c.proxy.Put(ctx, kind, hash, size, sizeOnDisk, rc)
 		}
 	}
 
@@ -656,11 +356,11 @@ func (c *diskCache) Put(kind cache.EntryKind, hash string, size int64, r io.Read
 	return nil
 }
 
-func (c *diskCache) writeAndCloseFile(r io.Reader, kind cache.EntryKind, hash string, size int64, f *os.File) (int64, error) {
+func (c *diskCache) writeAndCloseFile(ctx context.Context, r io.Reader, kind cache.EntryKind, hash string, size int64, f *os.File) (int64, error) {
 	closeFile := true
 	defer func() {
 		if closeFile {
-			f.Close()
+			_ = f.Close()
 		}
 	}()
 
@@ -668,16 +368,22 @@ func (c *diskCache) writeAndCloseFile(r io.Reader, kind cache.EntryKind, hash st
 	var sizeOnDisk int64
 
 	if kind == cache.CAS && c.storageMode != casblob.Identity {
-		sizeOnDisk, err = casblob.WriteAndClose(r, f, c.storageMode, hash, size)
+		sizeOnDisk, err = casblob.WriteAndClose(c.zstd, r, f, c.storageMode, hash, size)
 		if err != nil {
-			return -1, err
+			return -1, annotate.Err(ctx, "Failed to write compressed CAS blob to disk", err)
 		}
 		closeFile = false
 		return sizeOnDisk, nil
 	}
 
-	if sizeOnDisk, err = io.Copy(f, r); err != nil {
-		return -1, err
+	var writeCloser io.WriteCloser = f
+	if kind == cache.CAS { // c.storageMode == casblob.Identity
+		writeCloser = sha256verifier.New(hash, size, f)
+	}
+
+	sizeOnDisk, err = io.Copy(writeCloser, r)
+	if err != nil {
+		return -1, annotate.Err(ctx, "Failed to copy data to disk", err)
 	}
 
 	if isSizeMismatch(sizeOnDisk, size) {
@@ -685,14 +391,17 @@ func (c *diskCache) writeAndCloseFile(r io.Reader, kind cache.EntryKind, hash st
 			"sizes don't match. Expected %d, found %d", size, sizeOnDisk)
 	}
 
-	if err = f.Sync(); err != nil {
-		return -1, err
+	err = f.Sync()
+	if err != nil {
+		return -1, fmt.Errorf("failed to sync file to disk: %w", err)
 	}
 
-	if err = f.Close(); err != nil {
-		return -1, err
-	}
+	// This closes f, whether it is f itself or a verifier wrapping it.
 	closeFile = false
+	err = writeCloser.Close()
+	if err != nil {
+		return -1, fmt.Errorf("failed to verify hash: %w", err)
+	}
 
 	return sizeOnDisk, nil
 }
@@ -739,13 +448,14 @@ func (c *diskCache) commit(key string, legacy bool, tempfile string, reservedSiz
 // but that we can try the proxy backend.
 //
 // This function assumes that only CAS blobs are requested in zstd form.
-func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size int64, offset int64, zstd bool) (rc io.ReadCloser, foundSize int64, tryProxy bool, err error) {
+func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size int64, offset int64, zstd bool) (io.ReadCloser, int64, bool, error) {
 	locked := true
+	var err error
 	c.mu.Lock()
 
 	key := cache.LookupKey(kind, hash)
-	item, available := c.lru.Get(key)
-	if available {
+	item, listElem := c.lru.Get(key)
+	if listElem != nil {
 		c.mu.Unlock() // We expect a cache hit below.
 		locked = false
 
@@ -753,45 +463,56 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 
 		if !isSizeMismatch(size, item.size) {
 			var f *os.File
+			fastPath := true
 			f, err = os.Open(blobPath)
 			if err != nil && os.IsNotExist(err) {
 				// Another request replaced the file before we could open it?
 				// Enter slow path.
+				fastPath = false
 
 				c.mu.Lock()
-				item, available = c.lru.Get(key)
-				if available {
+				item, listElem = c.lru.Get(key)
+				if listElem != nil {
 					blobPath = path.Join(c.dir, c.FileLocation(kind, item.legacy, hash, item.size, item.random))
 					f, err = os.Open(blobPath)
+					if err != nil {
+						// We will log the error below, while not holding the lock.
+						c.lru.RemoveElement(listElem)
+					}
 				}
 				c.mu.Unlock()
 			}
 
 			if err != nil {
 				// Race condition, was the item purged after we released the lock?
-				log.Printf("Warning: expected %q to exist on disk, undersized cache?", blobPath)
+				log.Printf("Warning: expected %q to exist on disk (fast path: %t), undersized cache? Last reported error: %v", blobPath, fastPath, err)
 			} else if kind == cache.CAS {
+				var rc io.ReadCloser
 				if item.legacy {
 					// The file is uncompressed, without a casblob header.
 					_, err = f.Seek(offset, io.SeekStart)
 					if zstd && err == nil {
-						rc, err = casblob.GetLegacyZstdReadCloser(f)
+						rc, err = casblob.GetLegacyZstdReadCloser(c.zstd, f)
 					} else if err == nil {
 						rc = f
 					}
 				} else {
 					// The file is compressed.
 					if zstd {
-						rc, err = casblob.GetZstdReadCloser(f, size, offset)
+						rc, err = casblob.GetZstdReadCloser(c.zstd, f, size, offset)
 					} else {
-						rc, err = casblob.GetUncompressedReadCloser(f, size, offset)
+						rc, err = casblob.GetUncompressedReadCloser(c.zstd, f, size, offset)
 					}
 				}
 
 				if err != nil {
-					log.Printf("Warning: expected item to be on disk, but something happened: %v", err)
-					f.Close()
-					rc = nil
+					log.Printf("Warning: expected item to be on disk, but something happened when retrieving %s (compressed: %v, legacy: %v): %v",
+						blobPath, zstd, item.legacy, err)
+					_ = f.Close()
+
+					c.mu.Lock()
+					c.lru.RemoveElement(listElem)
+					c.mu.Unlock()
 				} else {
 					return rc, item.size, false, nil
 				}
@@ -799,7 +520,7 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 				var fileInfo os.FileInfo
 				fileInfo, err = f.Stat()
 				if err != nil {
-					f.Close()
+					_ = f.Close()
 					return nil, -1, true, err
 				}
 				foundSize := fileInfo.Size()
@@ -816,13 +537,18 @@ func (c *diskCache) availableOrTryProxy(kind cache.EntryKind, hash string, size 
 	}
 	err = nil
 
-	if c.proxy != nil {
+	var tryProxy bool
+
+	if c.proxy != nil && size <= c.maxProxyBlobSize {
 		if size > 0 {
 			// If we know the size, attempt to reserve that much space.
 			if !locked {
 				c.mu.Lock()
 			}
-			tryProxy, err = c.lru.Reserve(size)
+			err = c.lru.Reserve(size)
+			if err == nil {
+				tryProxy = true
+			}
 			c.mu.Unlock()
 			locked = false
 		} else {
@@ -860,6 +586,21 @@ func (c *diskCache) GetZstd(ctx context.Context, hash string, size int64, offset
 	return c.get(ctx, cache.CAS, hash, size, offset, true)
 }
 
+// errReader remembers the first error of the reader it wraps, other than io.EOF. This tells
+// them apart from errors about the data, which may come back wrapped by a zstd decoder.
+type errReader struct {
+	r   io.Reader
+	err error
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && err != io.EOF && e.err == nil {
+		e.err = err
+	}
+	return n, err
+}
+
 func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, size int64, offset int64, zstd bool) (rc io.ReadCloser, s int64, rErr error) {
 	// The hash format is checked properly in the http/grpc code.
 	// Just perform a simple/fast check here, to catch bad tests.
@@ -869,10 +610,10 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	if kind == cache.CAS && size <= 0 && hash == emptySha256 {
 		if zstd {
-			return ioutil.NopCloser(bytes.NewReader(emptyZstdBlob)), 0, nil
+			return io.NopCloser(bytes.NewReader(emptyZstdBlob)), 0, nil
 		}
 
-		return ioutil.NopCloser(bytes.NewReader([]byte{})), 0, nil
+		return io.NopCloser(bytes.NewReader([]byte{})), 0, nil
 	}
 
 	if kind != cache.CAS && zstd {
@@ -899,12 +640,9 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 	defer func() {
 		// No lock required to remove stray tempfiles.
 		if removeTempfile {
-			os.Remove(blobFile)
-		} else if blobFile != "" {
-			// Mark the file as "complete".
-			err := os.Chmod(blobFile, tempfile.EndMode)
+			err := os.Remove(blobFile)
 			if err != nil {
-				log.Println("Failed to mark", blobFile, "as complete:", err)
+				log.Printf("warning: failed to remove temp file: %q", blobFile)
 			}
 		}
 
@@ -922,7 +660,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	f, foundSize, tryProxy, err := c.availableOrTryProxy(kind, hash, size, offset, zstd)
 	if err != nil {
-		return nil, -1, internalErr(err)
+		return nil, -1, err
 	}
 	if tryProxy && size > 0 {
 		unreserve = true
@@ -935,14 +673,32 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		return nil, -1, nil
 	}
 
-	r, foundSize, err := c.proxy.Get(ctx, kind, hash)
+	// Non-proxied Get requests do not seem to consume any significant amount of OS threads,
+	// and are therefore not throttled. However, it is assumed that proxied Get requests might,
+	// at least when storing the result from the proxy to disk, and perhaps also when
+	// waiting for the proxy. Proxied Get requests are therefore throttled by a semaphore.
+	// Unfortunately, this proxy-specific throttling does not limit the size reservation
+	// performed inside availableOrTryProxy. It should still be effective in limiting the number
+	// of OS threads, but it does not help reduce the risk of http.StatusInsufficientStorage.
+	err = c.diskWaitSem.Acquire(context.Background(), 1)
+	if err != nil {
+		log.Printf("ERROR: failed to acquire semaphore: %v", err)
+		return nil, -1, internalErr(err)
+	}
+	defer c.diskWaitSem.Release(1)
+
+	r, foundSize, err := c.proxy.Get(ctx, kind, hash, size)
 	if r != nil {
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 	}
 	if err != nil {
 		return nil, -1, internalErr(err)
 	}
 	if r == nil {
+		return nil, -1, nil
+	}
+	if foundSize > c.maxProxyBlobSize {
+		_ = r.Close()
 		return nil, -1, nil
 	}
 
@@ -961,9 +717,41 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	blobFile = tf.Name()
 
+	// Don't trust a proxy backend to return the blob that was asked for: verify CAS blobs.
+	// Each case closes tf.
 	var sizeOnDisk int64
-	sizeOnDisk, err = io.Copy(tf, r)
-	tf.Close()
+	switch {
+	case legacy:
+		verifier := sha256verifier.New(hash, foundSize, tf)
+		sizeOnDisk, err = io.Copy(verifier, r)
+		// Keep a copy error rather than the size mismatch that it causes.
+		err = cmp.Or(err, verifier.Close())
+	case kind == cache.CAS:
+		// Proxy backends return compressed CAS blobs in the on-disk format, which is also a
+		// valid zstd stream. Decode and write it like an upload, so that neither its header
+		// nor its chunk table has to be trusted.
+		src := &errReader{r: r}
+		var dec io.ReadCloser
+		dec, err = c.zstd.GetDecoder(io.NopCloser(src))
+		if err != nil {
+			_ = tf.Close()
+			break
+		}
+		sizeOnDisk, err = casblob.WriteAndClose(c.zstd, dec, tf, c.storageMode, hash, foundSize)
+		_ = dec.Close()
+		// Failing to read from the proxy backend is an I/O error, not bad input.
+		err = cmp.Or(src.err, err)
+	default:
+		// AC and raw entries are keyed by action digest, not by a hash of their contents, so
+		// nothing can check them.
+		sizeOnDisk, err = io.Copy(tf, r)
+		err = cmp.Or(err, tf.Close())
+	}
+	// Bad data from the proxy backend is a cache miss, but I/O errors are internal errors.
+	if errors.Is(err, sha256verifier.ErrMismatch) || errors.Is(err, casblob.ErrBadInput) {
+		log.Printf("WARNING: proxy backend returned a bad CAS blob for %s: %v", hash, err)
+		return nil, -1, nil
+	}
 	if err != nil {
 		return nil, -1, internalErr(err)
 	}
@@ -983,15 +771,15 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 		}
 
 		if zstd {
-			rc, err = casblob.GetLegacyZstdReadCloser(rcf)
+			rc, err = casblob.GetLegacyZstdReadCloser(c.zstd, rcf)
 		} else {
 			rc = rcf
 		}
 	} else { // Compressed CAS blob.
 		if zstd {
-			rc, err = casblob.GetZstdReadCloser(rcf, foundSize, offset)
+			rc, err = casblob.GetZstdReadCloser(c.zstd, rcf, foundSize, offset)
 		} else {
-			rc, err = casblob.GetUncompressedReadCloser(rcf, foundSize, offset)
+			rc, err = casblob.GetUncompressedReadCloser(c.zstd, rcf, foundSize, offset)
 		}
 	}
 	if err != nil {
@@ -1000,7 +788,7 @@ func (c *diskCache) get(ctx context.Context, kind cache.EntryKind, hash string, 
 
 	unreserve, removeTempfile, err = c.commit(key, legacy, blobFile, size, foundSize, sizeOnDisk, random)
 	if err != nil {
-		rc.Close()
+		_ = rc.Close()
 		return nil, -1, internalErr(err)
 	}
 
@@ -1029,7 +817,8 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 	key := cache.LookupKey(kind, hash)
 
 	c.mu.Lock()
-	item, exists := c.lru.Get(key)
+	item, listElem := c.lru.Get(key)
+	exists := listElem != nil
 	if exists {
 		foundSize = item.size
 	}
@@ -1039,9 +828,9 @@ func (c *diskCache) Contains(ctx context.Context, kind cache.EntryKind, hash str
 		return true, foundSize
 	}
 
-	if c.proxy != nil {
-		exists, foundSize = c.proxy.Contains(ctx, kind, hash)
-		if exists && !isSizeMismatch(size, foundSize) {
+	if c.proxy != nil && size <= c.maxProxyBlobSize {
+		exists, foundSize = c.proxy.Contains(ctx, kind, hash, size)
+		if exists && foundSize <= c.maxProxyBlobSize && !isSizeMismatch(size, foundSize) {
 			return true, foundSize
 		}
 	}
@@ -1068,15 +857,6 @@ func isSizeMismatch(requestedSize int64, foundSize int64) bool {
 	return requestedSize > -1 && foundSize > -1 && requestedSize != foundSize
 }
 
-func ensureDirExists(path string) {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		err = os.MkdirAll(path, os.ModePerm)
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-}
-
 // GetValidatedActionResult returns a valid ActionResult and its serialized
 // value from the CAS if it and all its dependencies are also available. If
 // not, nil values are returned. If something unexpected went wrong, return
@@ -1084,7 +864,7 @@ func ensureDirExists(path string) {
 func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (*pb.ActionResult, []byte, error) {
 	rc, sizeBytes, err := c.Get(ctx, cache.AC, hash, -1, 0)
 	if rc != nil {
-		defer rc.Close()
+		defer func() { _ = rc.Close() }()
 	}
 	if err != nil {
 		return nil, nil, err
@@ -1094,7 +874,7 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 		return nil, nil, nil // aka "not found"
 	}
 
-	acdata, err := ioutil.ReadAll(rc)
+	acdata, err := io.ReadAll(rc)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1105,33 +885,40 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 		return nil, nil, err
 	}
 
+	// Validate the ActionResult's immediate fields, but don't check for dependent blobs.
+	err = validate.ActionResult(result)
+	if err != nil {
+		return nil, nil, err // Should we return "not found" instead of an error?
+	}
+
+	pendingValidations := []*pb.Digest{}
+
 	for _, f := range result.OutputFiles {
+		// f was validated in validate.ActionResult but blobs were not checked for existence
 		if len(f.Contents) == 0 {
-			found, _ := c.Contains(ctx, cache.CAS, f.Digest.Hash, f.Digest.SizeBytes)
-			if !found {
-				return nil, nil, nil // aka "not found"
-			}
+			pendingValidations = append(pendingValidations, f.Digest)
 		}
 	}
 
 	for _, d := range result.OutputDirectories {
+		// d was validated in validate.ActionResult but blobs were not checked for existence
 		r, size, err := c.Get(ctx, cache.CAS, d.TreeDigest.Hash, d.TreeDigest.SizeBytes, 0)
 		if r == nil {
 			return nil, nil, err // aka "not found", or an err if non-nil
 		}
 		if err != nil {
-			r.Close()
+			_ = r.Close()
 			return nil, nil, err
 		}
 		if size != d.TreeDigest.SizeBytes {
-			r.Close()
+			_ = r.Close()
 			return nil, nil, fmt.Errorf("expected %d bytes, found %d",
 				d.TreeDigest.SizeBytes, size)
 		}
 
 		var oddata []byte
-		oddata, err = ioutil.ReadAll(r)
-		r.Close()
+		oddata, err = io.ReadAll(r)
+		_ = r.Close()
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1143,40 +930,34 @@ func (c *diskCache) GetValidatedActionResult(ctx context.Context, hash string) (
 		}
 
 		for _, f := range tree.Root.GetFiles() {
-			if f.Digest == nil {
-				continue
-			}
-			found, _ := c.Contains(ctx, cache.CAS, f.Digest.Hash, f.Digest.SizeBytes)
-			if !found {
-				return nil, nil, nil // aka "not found"
+			if f.Digest != nil {
+				pendingValidations = append(pendingValidations, f.Digest)
 			}
 		}
 
 		for _, child := range tree.GetChildren() {
 			for _, f := range child.GetFiles() {
-				if f.Digest == nil {
-					continue
-				}
-				found, _ := c.Contains(ctx, cache.CAS, f.Digest.Hash, f.Digest.SizeBytes)
-				if !found {
-					return nil, nil, nil // aka "not found"
+				if f.Digest != nil {
+					pendingValidations = append(pendingValidations, f.Digest)
 				}
 			}
 		}
 	}
 
 	if result.StdoutDigest != nil {
-		found, _ := c.Contains(ctx, cache.CAS, result.StdoutDigest.Hash, result.StdoutDigest.SizeBytes)
-		if !found {
-			return nil, nil, nil // aka "not found"
-		}
+		pendingValidations = append(pendingValidations, result.StdoutDigest)
 	}
 
 	if result.StderrDigest != nil {
-		found, _ := c.Contains(ctx, cache.CAS, result.StderrDigest.Hash, result.StderrDigest.SizeBytes)
-		if !found {
-			return nil, nil, nil // aka "not found"
-		}
+		pendingValidations = append(pendingValidations, result.StderrDigest)
+	}
+
+	err = c.findMissingCasBlobsInternal(ctx, pendingValidations, true)
+	if errors.Is(err, errMissingBlob) {
+		return nil, nil, nil // aka "not found"
+	}
+	if err != nil {
+		return nil, nil, err
 	}
 
 	return result, acdata, nil

@@ -6,20 +6,23 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
-	asset "github.com/buchgr/bazel-remote/genproto/build/bazel/remote/asset/v1"
-	//pb "github.com/buchgr/bazel-remote/genproto/build/bazel/remote/execution/v2"
+	asset "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/asset/v1"
+	//pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
 
 	"google.golang.org/grpc/codes"
 
-	testutils "github.com/buchgr/bazel-remote/utils"
+	testutils "github.com/buchgr/bazel-remote/v2/utils"
 )
 
-// These tests rely on TestMain in grpc_test.go.
-
 func TestAssetFetchBlob(t *testing.T) {
+	t.Parallel()
+
+	fixture := grpcTestSetup(t)
+	defer func() { _ = os.Remove(fixture.tempdir) }()
 
 	ts := newTestGetServer()
 
@@ -44,7 +47,7 @@ func TestAssetFetchBlob(t *testing.T) {
 		},
 	}
 
-	resp, err := assetClient.FetchBlob(ctx, &req)
+	resp, err := fixture.assetClient.FetchBlob(ctx, &req)
 	if err != nil {
 		t.Fatal(err)
 	}

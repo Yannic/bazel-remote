@@ -7,30 +7,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 
-	"github.com/buchgr/bazel-remote/cache"
-	"github.com/buchgr/bazel-remote/cache/disk/casblob"
+	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
+	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-type uploadReq struct {
-	hash string
-	size int64
-	kind cache.EntryKind
-	rc   io.ReadCloser
-}
-
 type remoteHTTPProxyCache struct {
 	remote       *http.Client
 	baseURL      string
-	uploadQueue  chan<- uploadReq
+	uploadQueue  chan<- backendproxy.UploadReq
 	accessLogger cache.Logger
 	errorLogger  cache.Logger
 	requestURL   func(hash string, kind cache.EntryKind) string
@@ -48,54 +41,54 @@ var (
 	})
 )
 
-func (r *remoteHTTPProxyCache) uploadFile(item uploadReq) {
+func (r *remoteHTTPProxyCache) UploadFile(item backendproxy.UploadReq) {
 
-	if item.size == 0 {
-		item.rc.Close()
+	if item.LogicalSize == 0 {
+		_ = item.Rc.Close()
 		// See https://github.com/golang/go/issues/20257#issuecomment-299509391
-		item.rc = http.NoBody
+		item.Rc = http.NoBody
 	}
 
-	url := r.requestURL(item.hash, item.kind)
+	url := r.requestURL(item.Hash, item.Kind)
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, url, nil)
 	if err != nil {
 		r.errorLogger.Printf("INTERNAL ERROR, FAILED TO SETUP HTTP PROXY UPLOAD %s: %s", url, err)
-		item.rc.Close()
+		_ = item.Rc.Close()
 		return
 	}
 
 	rsp, err := r.remote.Do(req)
 	if err == nil && rsp.StatusCode == http.StatusOK {
-		r.accessLogger.Printf("SKIP UPLOAD %s", item.hash)
-		item.rc.Close()
+		r.accessLogger.Printf("SKIP UPLOAD %s", item.Hash)
+		_ = item.Rc.Close()
 		return
 	}
 
-	req, err = http.NewRequestWithContext(context.Background(), http.MethodPut, url, item.rc)
+	req, err = http.NewRequestWithContext(context.Background(), http.MethodPut, url, item.Rc)
 	if err != nil {
 		r.errorLogger.Printf("INTERNAL ERROR, FAILED TO SETUP HTTP PROXY UPLOAD %s: %s", url, err)
 
-		// item.rc will be closed if we call req.Do(), but not if we
+		// item.Rc will be closed if we call req.Do(), but not if we
 		// return earlier.
-		item.rc.Close()
+		_ = item.Rc.Close()
 
 		return
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = item.size
+	req.ContentLength = item.SizeOnDisk
 
 	rsp, err = r.remote.Do(req)
 	if err != nil {
 		r.errorLogger.Printf("HTTP %s UPLOAD: %s", url, err.Error())
 		return
 	}
-	_, err = io.Copy(ioutil.Discard, rsp.Body)
+	_, err = io.Copy(io.Discard, rsp.Body)
 	if err != nil {
 		r.errorLogger.Printf("HTTP %s UPLOAD: %s", url, err.Error())
 		return
 	}
-	rsp.Body.Close()
+	_ = rsp.Body.Close()
 
 	logResponse(r.accessLogger, "UPLOAD", rsp.StatusCode, url)
 }
@@ -115,7 +108,8 @@ func New(baseURL *url.URL, storageMode string, remote *http.Client,
 		v2mode:       storageMode == "zstd",
 	}
 
-	if storageMode == "zstd" {
+	switch storageMode {
+	case "zstd":
 		proxy.requestURL = func(hash string, kind cache.EntryKind) string {
 			if kind == cache.CAS {
 				return fmt.Sprintf("%s/cas.v2/%s", proxy.baseURL, hash)
@@ -123,28 +117,15 @@ func New(baseURL *url.URL, storageMode string, remote *http.Client,
 
 			return fmt.Sprintf("%s/%s/%s", proxy.baseURL, kind, hash)
 		}
-	} else if storageMode == "uncompressed" {
+	case "uncompressed":
 		proxy.requestURL = func(hash string, kind cache.EntryKind) string {
 			return fmt.Sprintf("%s/%s/%s", proxy.baseURL, kind, hash)
 		}
-	} else {
-		return nil, fmt.Errorf("Invalid http_proxy.mode specified: %q",
-			storageMode)
+	default:
+		return nil, fmt.Errorf("invalid http_proxy.mode specified: %q", storageMode)
 	}
 
-	if maxQueuedUploads > 0 && numUploaders > 0 {
-		uploadQueue := make(chan uploadReq, maxQueuedUploads)
-
-		for i := 0; i < numUploaders; i++ {
-			go func() {
-				for item := range uploadQueue {
-					proxy.uploadFile(item)
-				}
-			}()
-		}
-
-		proxy.uploadQueue = uploadQueue
-	}
+	proxy.uploadQueue = backendproxy.StartUploaders(proxy, numUploaders, maxQueuedUploads)
 
 	return proxy, nil
 }
@@ -154,28 +135,29 @@ func logResponse(logger cache.Logger, method string, code int, url string) {
 	logger.Printf("HTTP %s %d %s", method, code, url)
 }
 
-func (r *remoteHTTPProxyCache) Put(kind cache.EntryKind, hash string, size int64, rc io.ReadCloser) {
+func (r *remoteHTTPProxyCache) Put(ctx context.Context, kind cache.EntryKind, hash string, logicalSize int64, sizeOnDisk int64, rc io.ReadCloser) {
 	if r.uploadQueue == nil {
-		rc.Close()
+		_ = rc.Close()
 		return
 	}
 
-	item := uploadReq{
-		hash: hash,
-		size: size,
-		kind: kind,
-		rc:   rc,
+	item := backendproxy.UploadReq{
+		Hash:        hash,
+		LogicalSize: logicalSize,
+		SizeOnDisk:  sizeOnDisk,
+		Kind:        kind,
+		Rc:          rc,
 	}
 
 	select {
 	case r.uploadQueue <- item:
 	default:
 		r.errorLogger.Printf("too many uploads queued")
-		rc.Close()
+		_ = rc.Close()
 	}
 }
 
-func (r *remoteHTTPProxyCache) Get(ctx context.Context, kind cache.EntryKind, hash string) (io.ReadCloser, int64, error) {
+func (r *remoteHTTPProxyCache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (io.ReadCloser, int64, error) {
 	url := r.requestURL(hash, kind)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -201,7 +183,7 @@ func (r *remoteHTTPProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 		// If the failed http response contains some data then
 		// forward up to 1 KiB.
 		var errorBytes []byte
-		errorBytes, err = ioutil.ReadAll(io.LimitReader(rsp.Body, 1024))
+		errorBytes, err = io.ReadAll(io.LimitReader(rsp.Body, 1024))
 		var errorText string
 		if err == nil {
 			errorText = string(errorBytes)
@@ -221,7 +203,7 @@ func (r *remoteHTTPProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 
 	sizeBytesStr := rsp.Header.Get("Content-Length")
 	if sizeBytesStr == "" {
-		err = errors.New("Missing Content-Length header")
+		err = errors.New("missing Content-Length header")
 		cacheMisses.Inc()
 		return nil, -1, err
 	}
@@ -238,18 +220,18 @@ func (r *remoteHTTPProxyCache) Get(ctx context.Context, kind cache.EntryKind, ha
 	return rsp.Body, sizeBytes, nil
 }
 
-func (r *remoteHTTPProxyCache) Contains(ctx context.Context, kind cache.EntryKind, hash string) (bool, int64) {
+func (r *remoteHTTPProxyCache) Contains(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (bool, int64) {
 
 	url := r.requestURL(hash, kind)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
 	if err != nil {
 		return false, -1
 	}
 
 	rsp, err := r.remote.Do(req)
 	if err == nil && rsp.StatusCode == http.StatusOK {
-		if kind != cache.CAS {
+		if kind != cache.CAS || !r.v2mode {
 			return true, rsp.ContentLength
 		}
 

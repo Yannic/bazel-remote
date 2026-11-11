@@ -7,17 +7,18 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"strings"
 
-	pb "github.com/buchgr/bazel-remote/genproto/build/bazel/remote/execution/v2"
+	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/utils/validate"
+
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
-
-	"github.com/buchgr/bazel-remote/cache"
 )
 
 var (
@@ -25,6 +26,13 @@ var (
 	// we modify incoming ActionResults to make them non-zero.
 	errEmptyActionResult = status.Error(codes.Internal,
 		"rejecting empty ActionResult")
+
+	errNilActionDigest = status.Error(codes.InvalidArgument,
+		"expected a non-nil ActionDigest")
+	errNilGetActionResultRequest = status.Error(codes.InvalidArgument,
+		"expected a non-nil GetActionResultRequest")
+	errNilUpdateActionResultRequest = status.Error(codes.InvalidArgument,
+		"expected a non-nil UpdateActionResultRequest")
 )
 
 const (
@@ -40,6 +48,14 @@ func (s *grpcServer) GetActionResult(ctx context.Context,
 	req *pb.GetActionResultRequest) (*pb.ActionResult, error) {
 
 	logPrefix := "GRPC AC GET"
+
+	if req == nil {
+		return nil, errNilGetActionResultRequest
+	}
+
+	if req.ActionDigest == nil {
+		return nil, errNilActionDigest
+	}
 
 	if s.mangleACKeys {
 		req.ActionDigest.Hash = cache.TransformActionCacheKey(req.ActionDigest.Hash, req.InstanceName, s.accessLogger)
@@ -60,16 +76,16 @@ func (s *grpcServer) GetActionResult(ctx context.Context,
 		rdr, sizeBytes, err := s.cache.Get(ctx, cache.AC, req.ActionDigest.Hash, unknownActionResultSize, 0)
 		if err != nil {
 			s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
-			return nil, status.Error(codes.Unknown, err.Error())
+			return nil, status.Error(gRPCErrCode(err, codes.Unknown), err.Error())
 		}
 		if rdr == nil || sizeBytes <= 0 {
 			s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, "NOT FOUND")
 			return nil, status.Error(codes.NotFound,
 				fmt.Sprintf("%s not found in AC", req.ActionDigest.Hash))
 		}
-		defer rdr.Close()
+		defer func() { _ = rdr.Close() }()
 
-		acdata, err := ioutil.ReadAll(rdr)
+		acdata, err := io.ReadAll(rdr)
 		if err != nil {
 			s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
 			return nil, status.Error(codes.Unknown, err.Error())
@@ -82,6 +98,13 @@ func (s *grpcServer) GetActionResult(ctx context.Context,
 			return nil, status.Error(codes.Unknown, err.Error())
 		}
 
+		// This doesn't check deps, but does check for invalid fields.
+		err = validate.ActionResult(result)
+		if err != nil {
+			s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+
 		s.accessLogger.Printf("%s %s OK", logPrefix, req.ActionDigest.Hash)
 		return result, nil
 	}
@@ -89,7 +112,7 @@ func (s *grpcServer) GetActionResult(ctx context.Context,
 	result, _, err := s.cache.GetValidatedActionResult(ctx, req.ActionDigest.Hash)
 	if err != nil {
 		s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
-		return nil, status.Error(codes.Unknown, err.Error())
+		return nil, status.Error(gRPCErrCode(err, codes.Unknown), err.Error())
 	}
 
 	if result == nil {
@@ -158,12 +181,17 @@ func (s *grpcServer) maybeInline(ctx context.Context, inline bool, slice *[]byte
 
 		found, _ := s.cache.Contains(ctx, cache.CAS, (*digest).Hash, (*digest).SizeBytes)
 		if !found {
-			err := s.cache.Put(cache.CAS, (*digest).Hash, (*digest).SizeBytes,
+			err := s.cache.Put(ctx, cache.CAS, (*digest).Hash, (*digest).SizeBytes,
 				bytes.NewReader(*slice))
-			if err != nil && err != io.EOF {
-				return err
+			if err == nil || err == io.EOF {
+				s.accessLogger.Printf("GRPC CAS PUT %s OK", (*digest).Hash)
+			} else {
+				// De-inline failed (possibly due to "resource overload"). Preserve
+				// inlined data regardless of desire to de-inline.
+				s.accessLogger.Printf("GRPC CAS PUT %s %s", (*digest).Hash, err)
+				*inlinedSoFar += int64(len(*slice))
+				return nil
 			}
-			s.accessLogger.Printf("GRPC CAS PUT %s OK", (*digest).Hash)
 		}
 
 		*slice = []byte{}
@@ -195,15 +223,27 @@ func (s *grpcServer) maybeInline(ctx context.Context, inline bool, slice *[]byte
 func (s *grpcServer) UpdateActionResult(ctx context.Context,
 	req *pb.UpdateActionResultRequest) (*pb.ActionResult, error) {
 
-	if s.checkClientCertForWrites {
-		err := checkGRPCClientCert(ctx)
-		if err != nil {
-			return nil, err
-		}
+	logPrefix := "GRPC AC PUT"
+
+	if req == nil {
+		return nil, errNilUpdateActionResultRequest
 	}
 
-	logPrefix := "GRPC AC PUT"
+	if req.ActionDigest == nil {
+		return nil, errNilActionDigest
+	}
+
+	if s.mangleACKeys {
+		req.ActionDigest.Hash = cache.TransformActionCacheKey(req.ActionDigest.Hash, req.InstanceName, s.accessLogger)
+	}
+
 	err := s.validateHash(req.ActionDigest.Hash, req.ActionDigest.SizeBytes, logPrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate the ActionResult's immediate fields, but don't check for dependent blobs.
+	err = validate.ActionResult(req.ActionResult)
 	if err != nil {
 		return nil, err
 	}
@@ -223,10 +263,10 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 		return nil, errEmptyActionResult
 	}
 
-	err = s.cache.Put(cache.AC, req.ActionDigest.Hash,
+	err = s.cache.Put(ctx, cache.AC, req.ActionDigest.Hash,
 		int64(len(data)), bytes.NewReader(data))
 	if err != nil && err != io.EOF {
-		s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
+		s.logErrorPrintf(ctx, err, "%s %s %s", logPrefix, req.ActionDigest.Hash, err)
 		code := gRPCErrCode(err, codes.Internal)
 		return nil, status.Error(code, err.Error())
 	}
@@ -247,10 +287,10 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 				}
 			}
 
-			err = s.cache.Put(cache.CAS, f.Digest.Hash,
+			err = s.cache.Put(ctx, cache.CAS, f.Digest.Hash,
 				f.Digest.SizeBytes, bytes.NewReader(f.Contents))
 			if err != nil && err != io.EOF {
-				s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
+				s.logErrorPrintf(ctx, err, "%s %s %s", logPrefix, req.ActionDigest.Hash, err)
 				code := gRPCErrCode(err, codes.Internal)
 				return nil, status.Error(code, err.Error())
 			}
@@ -270,10 +310,10 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 			sizeBytes = int64(len(req.ActionResult.StdoutRaw))
 		}
 
-		err = s.cache.Put(cache.CAS, hash, sizeBytes,
+		err = s.cache.Put(ctx, cache.CAS, hash, sizeBytes,
 			bytes.NewReader(req.ActionResult.StdoutRaw))
 		if err != nil && err != io.EOF {
-			s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
+			s.logErrorPrintf(ctx, err, "%s %s %s", logPrefix, req.ActionDigest.Hash, err)
 			code := gRPCErrCode(err, codes.Internal)
 			return nil, status.Error(code, err.Error())
 		}
@@ -292,10 +332,10 @@ func (s *grpcServer) UpdateActionResult(ctx context.Context,
 			sizeBytes = int64(len(req.ActionResult.StderrRaw))
 		}
 
-		err = s.cache.Put(cache.CAS, hash, sizeBytes,
+		err = s.cache.Put(ctx, cache.CAS, hash, sizeBytes,
 			bytes.NewReader(req.ActionResult.StderrRaw))
 		if err != nil && err != io.EOF {
-			s.accessLogger.Printf("%s %s %s", logPrefix, req.ActionDigest.Hash, err)
+			s.logErrorPrintf(ctx, err, "%s %s %s", logPrefix, req.ActionDigest.Hash, err)
 			code := gRPCErrCode(err, codes.Internal)
 			return nil, status.Error(code, err.Error())
 		}

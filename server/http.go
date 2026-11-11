@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"html"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"regexp"
@@ -15,15 +14,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/buchgr/bazel-remote/cache"
-	"github.com/buchgr/bazel-remote/cache/disk"
-	pb "github.com/buchgr/bazel-remote/genproto/build/bazel/remote/execution/v2"
+	"github.com/buchgr/bazel-remote/v2/cache"
+	"github.com/buchgr/bazel-remote/v2/cache/disk"
+	"github.com/buchgr/bazel-remote/v2/utils/validate"
+
+	pb "github.com/buchgr/bazel-remote/v2/genproto/build/bazel/remote/execution/v2"
+
 	"github.com/klauspost/compress/zstd"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	syncpool "github.com/mostynb/zstdpool-syncpool"
 )
+
+// Status code to log when the client closed the connection before we responded.
+const statusClientClosedRequest = 499
 
 var blobNameSHA256 = regexp.MustCompile("^/?(.*/)?(ac/|cas/)([a-f0-9]{64})$")
 
@@ -33,6 +38,7 @@ var decoder, _ = zstd.NewReader(nil) // TODO: raise WithDecoderConcurrency ?
 type HTTPCache interface {
 	CacheHandler(w http.ResponseWriter, r *http.Request)
 	StatusPageHandler(w http.ResponseWriter, r *http.Request)
+	VerifyClientCertHandler(wrapMe http.Handler) http.Handler
 }
 
 type httpCache struct {
@@ -42,7 +48,10 @@ type httpCache struct {
 	validateAC               bool
 	mangleACKeys             bool
 	gitCommit                string
+	gitTags                  string
+	checkClientCertForReads  bool
 	checkClientCertForWrites bool
+	maxCasBlobSizeBytes      int64
 }
 
 type statusPageData struct {
@@ -53,6 +62,7 @@ type statusPageData struct {
 	NumFiles         int
 	ServerTime       int64
 	GitCommit        string
+	GitTags          string
 	NumGoroutines    int
 }
 
@@ -60,7 +70,7 @@ type statusPageData struct {
 // accessLogger will print one line for each HTTP request to stdout.
 // errorLogger will print unexpected server errors. Inexistent files and malformed URLs will not
 // be reported.
-func NewHTTPCache(cache disk.Cache, accessLogger cache.Logger, errorLogger cache.Logger, validateAC bool, mangleACKeys bool, checkClientCertForWrites bool, commit string) HTTPCache {
+func NewHTTPCache(cache disk.Cache, accessLogger cache.Logger, errorLogger cache.Logger, validateAC bool, mangleACKeys bool, checkClientCertForReads bool, checkClientCertForWrites bool, commit string, gitTags string, maxCasBlobSizeBytes int64) HTTPCache {
 
 	_, _, numItems, _ := cache.Stats()
 
@@ -72,11 +82,17 @@ func NewHTTPCache(cache disk.Cache, accessLogger cache.Logger, errorLogger cache
 		errorLogger:              errorLogger,
 		validateAC:               validateAC,
 		mangleACKeys:             mangleACKeys,
+		checkClientCertForReads:  checkClientCertForReads,
 		checkClientCertForWrites: checkClientCertForWrites,
+		maxCasBlobSizeBytes:      maxCasBlobSizeBytes,
 	}
 
 	if commit != "{STABLE_GIT_COMMIT}" {
 		hc.gitCommit = commit
+	}
+
+	if gitTags != "{GIT_TAGS}" {
+		hc.gitTags = gitTags
 	}
 
 	return hc
@@ -86,7 +102,7 @@ func NewHTTPCache(cache disk.Cache, accessLogger cache.Logger, errorLogger cache
 func parseRequestURL(url string, validateAC bool) (kind cache.EntryKind, hash string, instance string, err error) {
 	m := blobNameSHA256.FindStringSubmatch(url)
 	if m == nil {
-		err := fmt.Errorf("resource name must be a SHA256 hash in hex. "+
+		err := fmt.Errorf("resource name must be a SHA256 hash in hex, "+
 			"got '%s'", html.EscapeString(url))
 		return 0, "", "", err
 	}
@@ -95,7 +111,7 @@ func parseRequestURL(url string, validateAC bool) (kind cache.EntryKind, hash st
 
 	parts := m[2:]
 	if len(parts) != 2 {
-		err := fmt.Errorf("the path '%s' is invalid. expected (ac/|cas/)sha256",
+		err := fmt.Errorf("the path '%s' is invalid, expected (ac/|cas/)sha256",
 			html.EscapeString(url))
 		return 0, "", "", err
 	}
@@ -181,6 +197,8 @@ func (h *httpCache) handleGetValidAC(w http.ResponseWriter, r *http.Request, has
 		h.logResponse(http.StatusInternalServerError, r)
 		return
 	}
+
+	h.logResponse(http.StatusOK, r)
 }
 
 // Helper function for logging responses
@@ -196,7 +214,7 @@ func (h *httpCache) logResponse(code int, r *http.Request) {
 }
 
 func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 
 	kind, hash, instance, err := parseRequestURL(r.URL.Path, h.validateAC)
 	if err != nil {
@@ -205,12 +223,17 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.mangleACKeys && kind == cache.AC {
+	if h.mangleACKeys && (kind == cache.AC || kind == cache.RAW) {
 		hash = cache.TransformActionCacheKey(hash, instance, h.accessLogger)
 	}
 
 	switch m := r.Method; m {
 	case http.MethodGet:
+		if h.checkClientCertForReads && !h.hasValidClientCert(w, r) {
+			http.Error(w, "Authentication required for access", http.StatusUnauthorized)
+			h.logResponse(http.StatusUnauthorized, r)
+			return
+		}
 
 		if h.validateAC && kind == cache.AC {
 			h.handleGetValidAC(w, r, hash)
@@ -228,6 +251,11 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 			rdr, sizeBytes, err = h.cache.Get(r.Context(), kind, hash, -1, 0)
 		}
 		if err != nil {
+			if clientGone(r.Context(), err) {
+				h.accessLogger.Printf("GET %s: client gone: %s", path(kind, hash), err)
+				h.logResponse(statusClientClosedRequest, r)
+				return
+			}
 			if e, ok := err.(*cache.Error); ok {
 				http.Error(w, e.Error(), e.Code)
 			} else {
@@ -242,7 +270,7 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 			h.logResponse(http.StatusNotFound, r)
 			return
 		}
-		defer rdr.Close()
+		defer func() { _ = rdr.Close() }()
 
 		w.Header().Set("Content-Type", "application/octet-stream")
 		if zstdCompressed {
@@ -255,7 +283,13 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 
 		_, err := io.Copy(w, rdr)
 		if err != nil {
-			http.Error(w, "Unexpected copy error", http.StatusInternalServerError)
+			// No point calling http.Error here because we've already started writing data
+			if clientGone(r.Context(), err) {
+				h.accessLogger.Printf("GET %s/%s: client gone: %s", kind.String(), hash, err)
+				h.logResponse(statusClientClosedRequest, r)
+				return
+			}
+			h.errorLogger.Printf("Error writing %s/%s err: %s", kind.String(), hash, err.Error())
 			h.logResponse(http.StatusInternalServerError, r)
 			return
 		}
@@ -302,6 +336,14 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if contentLength > h.maxCasBlobSizeBytes {
+			msg := fmt.Sprintf("Blob size %d exceeds maximum allowed size %d",
+				contentLength, h.maxCasBlobSizeBytes)
+			http.Error(w, msg, http.StatusBadRequest)
+			h.errorLogger.Printf("PUT %s: %s", path(kind, hash), msg)
+			return
+		}
+
 		zstdCompressed := false
 
 		// Content-Encoding must be one of "identity", "zstd" or not present.
@@ -319,7 +361,7 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 		if h.validateAC && kind == cache.AC {
 			// verify that this is a valid ActionResult
 
-			data, err := ioutil.ReadAll(rdr)
+			data, err := io.ReadAll(rdr)
 			if err != nil {
 				msg := "failed to read request body"
 				http.Error(w, msg, http.StatusInternalServerError)
@@ -349,16 +391,32 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Ensure that the serialized ActionResult has non-zero length.
-			data, code, err := addWorkerMetadataHTTP(r.RemoteAddr, r.Header.Get("Content-Type"), data)
+			ar, code, err := addWorkerMetadataHTTP(r.RemoteAddr, r.Header.Get("Content-Type"), data)
 			if err != nil {
-				http.Error(w, err.Error(), code)
-				h.errorLogger.Printf("PUT %s: %s", path(kind, hash), err.Error())
+				msg := "Failed to add worker metadata: " + err.Error()
+				http.Error(w, msg, code)
+				h.errorLogger.Printf("PUT %s: %s", path(kind, hash), msg)
 				return
 			}
-			contentLength = int64(len(data))
 
-			// Note: we do not currently verify that the blobs exist
-			// in the CAS.
+			// Note: we do not currently verify that the blobs exist in the CAS.
+			err = validate.ActionResult(ar)
+			if err != nil {
+				msg := "Failed to marshal ActionResult: " + err.Error()
+				http.Error(w, msg, http.StatusBadRequest)
+				h.errorLogger.Printf("PUT %s: %s", path(kind, hash), msg)
+				return
+			}
+
+			data, err = proto.Marshal(ar)
+			if err != nil {
+				msg := "Failed to marshal ActionResult"
+				http.Error(w, msg, http.StatusInternalServerError)
+				h.errorLogger.Printf("PUT %s: %s", path(kind, hash), msg)
+				return
+			}
+
+			contentLength = int64(len(data))
 
 			rdr = bytes.NewReader(data)
 		}
@@ -381,23 +439,38 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			rc := z.IOReadCloser()
-			defer rc.Close()
+			defer func() { _ = rc.Close() }()
 			rdr = rc
 		}
 
-		err := h.cache.Put(kind, hash, contentLength, rdr)
+		err := h.cache.Put(r.Context(), kind, hash, contentLength, rdr)
 		if err != nil {
+			var msg string
 			if cerr, ok := err.(*cache.Error); ok {
-				http.Error(w, err.Error(), cerr.Code)
+				msg = cerr.Text
+				http.Error(w, msg, cerr.Code)
+				if cerr.Code == http.StatusInsufficientStorage {
+					// Using accessLogger to prevent too verbose logging
+					// to errorLogger.
+					h.logResponse(cerr.Code, r)
+				} else {
+					h.errorLogger.Printf("PUT %s: %s", path(kind, hash), msg)
+				}
 			} else {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				msg = "Unexpected error adding item to cache: " + err.Error()
+				http.Error(w, msg, http.StatusInternalServerError)
+				h.errorLogger.Printf("PUT %s: %s", path(kind, hash), msg)
 			}
-			h.errorLogger.Printf("PUT %s: %s", path(kind, hash), err)
 		} else {
 			h.logResponse(http.StatusOK, r)
 		}
 
 	case http.MethodHead:
+		if h.checkClientCertForReads && !h.hasValidClientCert(w, r) {
+			http.Error(w, "Authentication required for access", http.StatusUnauthorized)
+			h.logResponse(http.StatusUnauthorized, r)
+			return
+		}
 
 		if h.validateAC && kind == cache.AC {
 			h.handleContainsValidAC(w, r, hash)
@@ -413,7 +486,12 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		// Proxy backends may know a blob exists without knowing its size
+		// (eg the s3 proxy for compressed CAS blobs), so leave out
+		// Content-Length rather than sending an invalid value of -1.
+		if size >= 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		}
 		w.WriteHeader(http.StatusOK)
 		h.logResponse(http.StatusOK, r)
 
@@ -424,7 +502,7 @@ func (h *httpCache) CacheHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func addWorkerMetadataHTTP(addr string, ct string, orig []byte) (data []byte, code int, err error) {
+func addWorkerMetadataHTTP(addr string, ct string, orig []byte) (actionResult *pb.ActionResult, code int, err error) {
 	ar := &pb.ActionResult{}
 	if ct == "application/json" {
 		err = protojson.Unmarshal(orig, ar)
@@ -432,13 +510,13 @@ func addWorkerMetadataHTTP(addr string, ct string, orig []byte) (data []byte, co
 		err = proto.Unmarshal(orig, ar)
 	}
 	if err != nil {
-		return orig, http.StatusBadRequest, err
+		return nil, http.StatusBadRequest, err
 	}
 
 	if ar.ExecutionMetadata == nil {
 		ar.ExecutionMetadata = &pb.ExecutedActionMetadata{}
 	} else if ar.ExecutionMetadata.Worker != "" {
-		return orig, http.StatusOK, nil
+		return ar, http.StatusOK, nil
 	}
 
 	worker := addr
@@ -451,17 +529,12 @@ func addWorkerMetadataHTTP(addr string, ct string, orig []byte) (data []byte, co
 
 	ar.ExecutionMetadata.Worker = worker
 
-	data, err = proto.Marshal(ar)
-	if err != nil {
-		return orig, http.StatusInternalServerError, err
-	}
-
-	return data, http.StatusOK, nil
+	return ar, http.StatusOK, nil
 }
 
 // Produce a debugging page with some stats about the cache.
 func (h *httpCache) StatusPageHandler(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 
 	totalSize, reservedSize, numItems, uncompressedSize := h.cache.Stats()
 
@@ -478,6 +551,7 @@ func (h *httpCache) StatusPageHandler(w http.ResponseWriter, r *http.Request) {
 		NumFiles:         numItems,
 		ServerTime:       time.Now().Unix(),
 		GitCommit:        h.gitCommit,
+		GitTags:          h.gitTags,
 		NumGoroutines:    goroutines,
 	})
 	if err != nil {
@@ -515,4 +589,17 @@ func (h *httpCache) hasValidClientCert(w http.ResponseWriter, r *http.Request) b
 	}
 
 	return true
+}
+
+// VerifyClientCertHandler returns a http.Handler which wraps another Handler,
+// but only calls the inner Handler if the request has a valid client cert.
+// This is only used when mutual TLS authentication is enabled.
+func (h *httpCache) VerifyClientCertHandler(wrapMe http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !h.hasValidClientCert(w, r) {
+			return
+		}
+
+		wrapMe.ServeHTTP(w, r)
+	})
 }

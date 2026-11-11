@@ -4,13 +4,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/buchgr/bazel-remote/utils/idle"
+	"github.com/buchgr/bazel-remote/v2/utils/idle"
 )
 
 func TestIdleTimer(t *testing.T) {
 	tearDown := make(chan struct{})
-	it := idle.NewTimer(time.Second)
-	it.Register(tearDown)
+	it := idle.NewTimer(time.Second, tearDown)
 	it.Start()
 
 	for i := 0; i < 5; i++ {

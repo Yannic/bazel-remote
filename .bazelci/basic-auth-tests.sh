@@ -27,8 +27,9 @@ echo 'topsecretusername:$apr1$Ke2kcK4W$EyueqiHyoqhwXcpiEGNyJ1' \
 	> "$tmpdir/htpasswd"
 
 echo "Starting bazel-remote, allowing unauthenticated reads..."
-./bazel-remote --dir "$tmpdir/cache" --max_size 1 --port "$HTTP_PORT" \
+./bazel-remote --dir "$tmpdir/cache" --max_size 1 --http_address "0.0.0.0:$HTTP_PORT" \
 	--htpasswd_file "$tmpdir/htpasswd" \
+	--enable_endpoint_metrics \
 	--allow_unauthenticated_reads > "$tmpdir/bazel-remote.log" 2>&1 &
 server_pid=$!
 
@@ -38,6 +39,8 @@ running=false
 for i in $(seq 1 20)
 do
 	sleep 1
+
+	ps -p $server_pid > /dev/null || break
 
 	if wget --inet4-only -d -O - --timeout=2 \
 		--http-user "$USER" --http-password "$PASS" \
@@ -54,6 +57,11 @@ then
 	kill -9 $server_pid
 	exit 1
 fi
+
+# Check that metrics are working (requires authentication).
+wget --inet4-only -d -O - \
+	--http-user "$USER" --http-password "$PASS" \
+	http://localhost:$HTTP_PORT/metrics
 
 # Authenticated read.
 wget --inet4-only -d -O - \
@@ -133,8 +141,11 @@ bazel build //:bazel-remote --remote_cache=grpc://localhost:9092 \
 #fi
 
 # Restart the server with authentication enabled but unauthenticated reads disabled.
+# Add --enable_endpoint_metrics to check that #920 is fixed.
 kill -9 $server_pid
-./bazel-remote --dir "$tmpdir/cache" --max_size 1 --port "$HTTP_PORT" \
+sleep 2
+./bazel-remote --dir "$tmpdir/cache" --max_size 1 --http_address "0.0.0.0:$HTTP_PORT" \
+	--enable_endpoint_metrics \
 	--htpasswd_file "$tmpdir/htpasswd" > "$tmpdir/bazel-remote-authenticated.log" 2>&1 &
 server_pid=$!
 
@@ -144,6 +155,8 @@ running=false
 for i in $(seq 1 20)
 do
 	sleep 1
+
+	ps -p $server_pid > /dev/null || break
 
 	if wget --inet4-only -d -O - --timeout=2 \
 		--http-user "$USER" --http-password "$PASS" \
@@ -169,6 +182,15 @@ wget --inet4-only -d -O - --timeout=2 \
 # Unauthenticated read should fail.
 if wget --inet4-only -d -O - --timeout=2 \
 	"http://localhost:$HTTP_PORT/cas/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+then
+	echo "Error: expected unauthenticated read to fail"
+	kill -9 $server_pid
+	exit 1
+fi
+
+# Unauthenticated status read should fail.
+if wget --inet4-only -d -O - --timeout=2 \
+	"http://localhost:$HTTP_PORT/status"
 then
 	echo "Error: expected unauthenticated read to fail"
 	kill -9 $server_pid

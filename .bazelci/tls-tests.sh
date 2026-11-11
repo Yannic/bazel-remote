@@ -37,7 +37,7 @@ generate_keys() {
 
 	# Add subjectAltName aka "SAN", which replaces CN.
 	# Required for Go >= 1.15.
-	cat << EOF > domain.ext
+	cat << EOF > "$tmpdir/domain.ext"
 authorityKeyIdentifier=keyid,issuer
 basicConstraints=CA:FALSE
 keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
@@ -48,7 +48,7 @@ EOF
 
 	# Self-signed server certificate:
 	openssl x509 -req -passin pass:1111 -days 358000 -in "$tmpdir/server.csr" \
-		-extfile domain.ext \
+		-extfile "$tmpdir/domain.ext" \
 		-CA "$tmpdir/ca.crt" -CAkey "$tmpdir/ca.key" -set_serial 01 -out "$tmpdir/server.crt"
 
 	# Remove passphrase from server key:
@@ -80,10 +80,11 @@ generate_keys
 [ -e bazel-remote ] || ./linux-build.sh
 
 echo "Starting bazel-remote, allowing unauthenticated reads..."
-./bazel-remote --dir "$tmpdir/cache" --max_size 1 --port "$HTTP_PORT" \
+./bazel-remote --dir "$tmpdir/cache" --max_size 1 --http_address "0.0.0.0:$HTTP_PORT" \
 	--tls_cert_file "$tmpdir/server.crt" \
 	--tls_key_file "$tmpdir/server.key" \
 	--tls_ca_file "$tmpdir/ca.crt" \
+	--enable_endpoint_metrics \
 	--allow_unauthenticated_reads > "$tmpdir/bazel-remote.log" 2>&1 &
 server_pid=$!
 
@@ -93,6 +94,8 @@ running=false
 for i in $(seq 1 20)
 do
 	sleep 1
+
+	ps -p $server_pid > /dev/null || break
 
 	if wget --inet4-only -d -O - --ca-certificate=$tmpdir/server.crt \
 		--certificate=$tmpdir/client.crt \
@@ -111,6 +114,13 @@ then
 	kill -9 $server_pid
 	exit 1
 fi
+
+# Check that metrics are working (requires authentication).
+wget --inet4-only -d -O - --ca-certificate=$tmpdir/server.crt \
+	--certificate=$tmpdir/client.crt \
+	--private-key=$tmpdir/client.pem \
+	--timeout=2 \
+	"https://localhost:$HTTP_PORT/metrics"
 
 # Authenticated read.
 wget --inet4-only -d -O - --ca-certificate=$tmpdir/server.crt \
@@ -173,7 +183,8 @@ bazel build //:bazel-remote --remote_cache=grpcs://localhost:9092 \
 
 # Restart the server with authentication enabled but unauthenticated reads disabled.
 kill -9 $server_pid
-./bazel-remote --dir "$tmpdir/cache" --max_size 1 --port "$HTTP_PORT" \
+sleep 2
+./bazel-remote --dir "$tmpdir/cache" --max_size 1 --http_address "0.0.0.0:$HTTP_PORT" \
 	--tls_cert_file "$tmpdir/server.crt" \
 	--tls_key_file "$tmpdir/server.key" \
 	--tls_ca_file "$tmpdir/ca.crt" > "$tmpdir/bazel-remote-authenticated.log" 2>&1 &
@@ -185,6 +196,8 @@ running=false
 for i in $(seq 1 20)
 do
 	sleep 1
+
+	ps -p $server_pid > /dev/null || break
 
 	if wget --inet4-only -d -O - --ca-certificate=$tmpdir/server.crt \
 		--certificate=$tmpdir/client.crt \

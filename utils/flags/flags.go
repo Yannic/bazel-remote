@@ -6,12 +6,28 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/buchgr/bazel-remote/cache/s3proxy"
+	"github.com/buchgr/bazel-remote/v2/cache/azblobproxy"
+	"github.com/buchgr/bazel-remote/v2/cache/disk/zstdimpl"
+	"github.com/buchgr/bazel-remote/v2/cache/s3proxy"
+
 	"github.com/urfave/cli/v2"
 )
 
 func s3AuthMsg(authMethods ...string) string {
 	return fmt.Sprintf("Applies to s3 auth method(s): %s.", strings.Join(authMethods, ", "))
+}
+
+func azBlobAuthMsg(authMethods ...string) string {
+	return fmt.Sprintf("Applies to AzBlob auth method(s): %s.", strings.Join(authMethods, ", "))
+}
+
+func getSupportedZstdImplsString() string {
+	impls := zstdimpl.GetImplementations()
+	for i, name := range impls {
+		impls[i] = "\"" + name + "\""
+	}
+
+	return strings.Join(impls, ", ")
 }
 
 // GetCliFlags returns a slice of cli.Flag's that bazel-remote accepts.
@@ -32,9 +48,16 @@ func GetCliFlags() []cli.Flag {
 		},
 		&cli.Int64Flag{
 			Name:    "max_size",
-			Value:   -1,
-			Usage:   "The maximum size of the remote cache in GiB. This flag is required.",
+			Usage:   "The maximum size of bazel-remote's disk cache in GiB. This flag is required.",
 			EnvVars: []string{"BAZEL_REMOTE_MAX_SIZE"},
+		},
+		&cli.Int64Flag{
+			Name:  "max_size_hard_limit",
+			Value: -1,
+			Usage: "If enabled, the maximum size of bazel-remote's disk cache including files queued " +
+				"for eviction in GiB, before bazel-remote will reject write requests. A reasonable " +
+				"value might be 5% larger than --max_size.",
+			EnvVars: []string{"BAZEL_REMOTE_MAX_SIZE_HARD_LIMIT"},
 		},
 		&cli.StringFlag{
 			Name:    "storage_mode",
@@ -43,33 +66,59 @@ func GetCliFlags() []cli.Flag {
 			EnvVars: []string{"BAZEL_REMOTE_STORAGE_MODE"},
 		},
 		&cli.StringFlag{
+			Name:    "zstd_implementation",
+			Value:   "go",
+			Usage:   "ZSTD implementation to use. Supported values: " + getSupportedZstdImplsString(),
+			EnvVars: []string{"BAZEL_REMOTE_ZSTD_IMPLEMENTATION"},
+		},
+		&cli.StringFlag{
+			Name:    "http_address",
+			Usage:   "Address specification for the HTTP server listener, formatted either as [host]:port for TCP or unix://path.sock for Unix domain sockets.",
+			EnvVars: []string{"BAZEL_REMOTE_HTTP_ADDRESS"},
+		},
+		&cli.StringFlag{
 			Name:    "host",
 			Value:   "",
-			Usage:   "Address to listen on. Listens on all network interfaces by default.",
+			Usage:   "DEPRECATED. Use --http_address to specify the HTTP server listener.",
 			EnvVars: []string{"BAZEL_REMOTE_HOST"},
 		},
 		&cli.IntFlag{
 			Name:    "port",
 			Value:   8080,
-			Usage:   "The port the HTTP server listens on.",
+			Usage:   "DEPRECATED. Use --http_address to specify the HTTP server listener.",
 			EnvVars: []string{"BAZEL_REMOTE_PORT"},
+		},
+		&cli.StringFlag{
+			Name: "grpc_address",
+			Usage: "Address specification for the gRPC server listener, formatted either as [host]:port for TCP or unix://path.sock for Unix domain sockets. " +
+				"Set to 'none' to disable.",
+			EnvVars: []string{"BAZEL_REMOTE_GRPC_ADDRESS"},
 		},
 		&cli.IntFlag{
 			Name:    "grpc_port",
 			Value:   9092,
-			Usage:   "The port the gRPC server listens on. Set to 0 to disable.",
+			Usage:   "DEPRECATED. Use --grpc_address to specify the gRPC server listener. Set to 0 to disable.",
 			EnvVars: []string{"BAZEL_REMOTE_GRPC_PORT"},
 		},
 		&cli.StringFlag{
-			Name:    "profile_host",
-			Value:   "127.0.0.1",
-			Usage:   "A host address to listen on for profiling, if enabled by a valid --profile_port setting.",
+			Name: "profile_address",
+			Usage: "Address specification for a http server to listen on for profiling, formatted either as [host]:port for TCP or " +
+				"unix://path.sock for Unix domain sockets. Off by default, but can also be set to 'none' to disable explicitly.",
+			DefaultText: "\"\", ie profiling disabled",
+			EnvVars:     []string{"BAZEL_REMOTE_PROFILE_ADDRESS"},
+		},
+		&cli.StringFlag{
+			Name:  "profile_host",
+			Value: "127.0.0.1",
+			Usage: "DEPRECATED. Use --profile_address instead. A host address to listen on for profiling, if enabled by " +
+				"a valid --profile_port setting.",
 			EnvVars: []string{"BAZEL_REMOTE_PROFILE_HOST"},
 		},
 		&cli.IntFlag{
-			Name:        "profile_port",
-			Value:       0,
-			Usage:       "If a positive integer, serve /debug/pprof/* URLs from http://profile_host:profile_port.",
+			Name:  "profile_port",
+			Value: 0,
+			Usage: "DEPRECATED. Use --profile_address instead. If a positive integer, serve /debug/pprof/* URLs " +
+				"from http://profile_host:profile_port.",
 			DefaultText: "0, ie profiling disabled",
 			EnvVars:     []string{"BAZEL_REMOTE_PROFILE_PORT"},
 		},
@@ -92,6 +141,12 @@ func GetCliFlags() []cli.Flag {
 			Value:   "",
 			Usage:   "Path to a .htpasswd file. This flag is optional. Please read https://httpd.apache.org/docs/2.4/programs/htpasswd.html.",
 			EnvVars: []string{"BAZEL_REMOTE_HTPASSWD_FILE"},
+		},
+		&cli.StringFlag{
+			Name:    "min_tls_version",
+			Value:   "1.0",
+			Usage:   "The minimum TLS version that is acceptable for incoming requests (does not apply to proxy backends). Allowed values: 1.0, 1.1, 1.2, 1.3.",
+			EnvVars: []string{"BAZEL_REMOTE_MIN_TLS_VERSION"},
 		},
 		&cli.StringFlag{
 			Name:    "tls_ca_file",
@@ -138,6 +193,13 @@ func GetCliFlags() []cli.Flag {
 			DefaultText: strconv.FormatInt(math.MaxInt64, 10),
 			EnvVars:     []string{"BAZEL_REMOTE_MAX_BLOB_SIZE"},
 		},
+		&cli.Int64Flag{
+			Name:        "max_proxy_blob_size",
+			Value:       math.MaxInt64,
+			Usage:       "The maximum logical/uncompressed blob size that will be downloaded from proxies. Note that this limit is not applied to preexisting blobs in the cache.",
+			DefaultText: strconv.FormatInt(math.MaxInt64, 10),
+			EnvVars:     []string{"BAZEL_REMOTE_MAX_PROXY_BLOB_SIZE"},
+		},
 		&cli.IntFlag{
 			Name:    "num_uploaders",
 			Value:   100,
@@ -145,10 +207,52 @@ func GetCliFlags() []cli.Flag {
 			EnvVars: []string{"BAZEL_REMOTE_NUM_UPLOADERS"},
 		},
 		&cli.StringFlag{
+			Name:    "grpc_proxy.url",
+			Value:   "",
+			Usage:   "The base URL to use for the experimental grpc proxy backend, e.g. grpc://localhost:9090 or grpcs://example.com:7070. Note that this requires a backend with remote asset API support if you want http client requests to work.",
+			EnvVars: []string{"BAZEL_REMOTE_GRPC_PROXY_URL"},
+		},
+		&cli.StringFlag{
+			Name:    "grpc_proxy.key_file",
+			Value:   "",
+			Usage:   "Path to a key used to authenticate with the proxy backend using mTLS. If this flag is provided, then grpc_proxy.cert_file must also be specified.",
+			EnvVars: []string{"BAZEL_REMOTE_GRPC_PROXY_KEY_FILE"},
+		},
+		&cli.StringFlag{
+			Name:    "grpc_proxy.cert_file",
+			Value:   "",
+			Usage:   "Path to a certificate used to authenticate with the proxy backend using mTLS. If this flag is provided, then grpc_proxy.key_file must also be specified.",
+			EnvVars: []string{"BAZEL_REMOTE_GRPC_PROXY_CERT_FILE"},
+		},
+		&cli.StringFlag{
+			Name:    "grpc_proxy.ca_file",
+			Value:   "",
+			Usage:   "Path to a certificate autority used to validate the grpc proxy backend certificate.",
+			EnvVars: []string{"BAZEL_REMOTE_GRPC_PROXY_CA_FILE"},
+		},
+		&cli.StringFlag{
 			Name:    "http_proxy.url",
 			Value:   "",
 			Usage:   "The base URL to use for a http proxy backend.",
 			EnvVars: []string{"BAZEL_REMOTE_HTTP_PROXY_URL"},
+		},
+		&cli.StringFlag{
+			Name:    "http_proxy.key_file",
+			Value:   "",
+			Usage:   "Path to a key used to authenticate with the proxy backend using mTLS. If this flag is provided, then http_proxy.cert_file must also be specified.",
+			EnvVars: []string{"BAZEL_REMOTE_HTTP_PROXY_KEY_FILE"},
+		},
+		&cli.StringFlag{
+			Name:    "http_proxy.cert_file",
+			Value:   "",
+			Usage:   "Path to a certificate used to authenticate with the proxy backend using mTLS. If this flag is provided, then http_proxy.key_file must also be specified.",
+			EnvVars: []string{"BAZEL_REMOTE_HTTP_PROXY_CERT_FILE"},
+		},
+		&cli.StringFlag{
+			Name:    "http_proxy.ca_file",
+			Value:   "",
+			Usage:   "Path to a certificate autority used to validate the http proxy backend certificate.",
+			EnvVars: []string{"BAZEL_REMOTE_HTTP_PROXY_CA_FILE"},
 		},
 		&cli.StringFlag{
 			Name:    "gcs_proxy.bucket",
@@ -169,6 +273,48 @@ func GetCliFlags() []cli.Flag {
 			EnvVars: []string{"BAZEL_REMOTE_GCS_JSON_CREDENTIALS_FILE"},
 		},
 		&cli.StringFlag{
+			Name:    "ldap.url",
+			Value:   "",
+			Usage:   "The LDAP URL which may include a port. LDAP over SSL (LDAPs) is also supported. Note that this feature is currently considered experimental.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_URL"},
+		},
+		&cli.StringFlag{
+			Name:    "ldap.base_dn",
+			Value:   "",
+			Usage:   "The distinguished name of the search base.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_BASE_DN"},
+		},
+		// to allow anonymous access do not require BindUser or BindPassword
+		&cli.StringFlag{
+			Name:    "ldap.bind_user",
+			Value:   "",
+			Usage:   "The user who is allowed to perform a search within the base DN. If none is specified the connection and the search is performed without an authentication. It is recommended to use a read-only account.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_BIND_USER"},
+		},
+		&cli.StringFlag{
+			Name:    "ldap.bind_password",
+			Value:   "",
+			Usage:   "The password of the bind user.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_BIND_PASSWORD"},
+		},
+		&cli.StringFlag{
+			Name:    "ldap.username_attribute",
+			Value:   "uid",
+			Usage:   "The user attribute of a connecting user.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_USER_ATTRIBUTE"},
+		},
+		&cli.StringFlag{
+			Name:    "ldap.groups_query",
+			Usage:   "Filter clause for searching groups.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_GROUPS_QUERY"},
+		},
+		&cli.IntFlag{
+			Name:    "ldap.cache_time",
+			Value:   3600,
+			Usage:   "The amount of time to cache a successful authentication in seconds.",
+			EnvVars: []string{"BAZEL_REMOTE_LDAP_CACHE_TIME"},
+		},
+		&cli.StringFlag{
 			Name:    "s3.endpoint",
 			Value:   "",
 			Usage:   "The S3/minio endpoint to use when using S3 proxy backend.",
@@ -179,6 +325,12 @@ func GetCliFlags() []cli.Flag {
 			Value:   "",
 			Usage:   "The S3/minio bucket to use when using S3 proxy backend.",
 			EnvVars: []string{"BAZEL_REMOTE_S3_BUCKET"},
+		},
+		&cli.StringFlag{
+			Name:    "s3.bucket_lookup_type",
+			Value:   "auto",
+			Usage:   "The S3/minio bucket lookup type to use when using S3 proxy backend. Allowed values: auto, dns, path.",
+			EnvVars: []string{"BAZEL_REMOTE_S3_BUCKET_LOOKUP_TYPE"},
 		},
 		&cli.StringFlag{
 			Name:    "s3.prefix",
@@ -205,6 +357,18 @@ func GetCliFlags() []cli.Flag {
 			EnvVars: []string{"BAZEL_REMOTE_S3_SECRET_ACCESS_KEY"},
 		},
 		&cli.StringFlag{
+			Name:    "s3.session_token",
+			Value:   "",
+			Usage:   "The S3/minio session token to use when using S3 proxy backend. Optional. " + s3AuthMsg(s3proxy.AuthMethodAccessKey),
+			EnvVars: []string{"BAZEL_REMOTE_S3_SESSION_TOKEN"},
+		},
+		&cli.StringFlag{
+			Name:        "s3.signature_type",
+			Usage:       "Which type of s3 signature to use when using S3 proxy backend. Only applies when using the s3 access_key auth method. Allowed values: v2, v4, v4streaming, anonymous.",
+			DefaultText: "v4",
+			EnvVars:     []string{"BAZEL_REMOTE_S3_SIGNATURE_TYPE"},
+		},
+		&cli.StringFlag{
 			Name:    "s3.aws_shared_credentials_file",
 			Value:   "",
 			Usage:   "Path to the AWS credentials file. If not specified, the minio client will default to '~/.aws/credentials'. " + s3AuthMsg(s3proxy.AuthMethodAWSCredentialsFile),
@@ -221,6 +385,12 @@ func GetCliFlags() []cli.Flag {
 			Usage:       "Whether to disable TLS/SSL when using the S3 proxy backend.",
 			DefaultText: "false, ie enable TLS/SSL",
 			EnvVars:     []string{"BAZEL_REMOTE_S3_DISABLE_SSL"},
+		},
+		&cli.BoolFlag{
+			Name:        "s3.update_timestamps",
+			Usage:       "Whether to update timestamps of object on cache hit.",
+			DefaultText: "false",
+			EnvVars:     []string{"BAZEL_REMOTE_S3_UPDATE_TIMESTAMPS"},
 		},
 		&cli.StringFlag{
 			Name:    "s3.iam_role_endpoint",
@@ -240,6 +410,72 @@ func GetCliFlags() []cli.Flag {
 			Value:       2,
 			DefaultText: "2",
 			EnvVars:     []string{"BAZEL_REMOTE_S3_KEY_VERSION"},
+		},
+		&cli.IntFlag{
+			Name:        "s3.max_idle_conns",
+			Usage:       "The maximum number of idle connections to use when using the S3 proxy backend.",
+			DefaultText: "1024",
+			EnvVars:     []string{"BAZEL_REMOTE_S3_MAX_IDLE_CONNS"},
+		},
+		&cli.StringFlag{
+			Name:    "azblob.tenant_id",
+			Value:   "",
+			Usage:   "The Azure blob storage tenant id to use when using azblob proxy backend.",
+			EnvVars: []string{"BAZEL_REMOTE_AZBLOB_TENANT_ID", "AZURE_TENANT_ID"},
+		},
+		&cli.StringFlag{
+			Name:    "azblob.storage_account",
+			Value:   "",
+			Usage:   "The Azure blob storage storage account to use when using azblob proxy backend.",
+			EnvVars: []string{"BAZEL_REMOTE_AZBLOB_STORAGE_ACCOUNT"},
+		},
+		&cli.StringFlag{
+			Name:    "azblob.container_name",
+			Value:   "",
+			Usage:   "The Azure blob storage container name to use when using azblob proxy backend.",
+			EnvVars: []string{"BAZEL_REMOTE_AZBLOB_CONTAINER_NAME"},
+		},
+		&cli.StringFlag{
+			Name:    "azblob.prefix",
+			Value:   "",
+			Usage:   "The Azure blob storage object prefix to use when using azblob proxy backend.",
+			EnvVars: []string{"BAZEL_REMOTE_AZBLOB_PREFIX"},
+		},
+		&cli.BoolFlag{
+			Name:        "azblob.update_timestamps",
+			Usage:       "Whether to update timestamps of object on cache hit.",
+			DefaultText: "false",
+			EnvVars:     []string{"BAZEL_REMOTE_AZBLOB_UPDATE_TIMESTAMPS"},
+		},
+		&cli.StringFlag{
+			Name:    "azblob.auth_method",
+			Value:   "",
+			Usage:   fmt.Sprintf("The Azure blob storage authentication method. This argument is required when an azblob proxy backend is used. Allowed values: %s.", strings.Join(azblobproxy.GetAuthMethods(), ", ")),
+			EnvVars: []string{"BAZEL_REMOTE_AZBLOB_AUTH_METHOD"},
+		},
+		&cli.StringFlag{
+			Name:    "azblob.shared_key",
+			Value:   "",
+			Usage:   "The Azure blob storage account access key to use when using azblob proxy backend. " + azBlobAuthMsg(azblobproxy.AuthMethodSharedKey),
+			EnvVars: []string{"BAZEL_REMOTE_AZBLOB_SHARED_KEY", "AZURE_STORAGE_ACCOUNT_KEY"},
+		},
+		&cli.StringFlag{
+			Name:    "azblob.client_id",
+			Value:   "",
+			Usage:   "The Azure blob storage client id to use when using azblob proxy backend. " + azBlobAuthMsg(azblobproxy.AuthMethodClientSecret, azblobproxy.AuthMethodClientCertificate),
+			EnvVars: []string{"BAZEL_REMOTE_AZBLOB_CLIENT_ID", "AZURE_CLIENT_ID"},
+		},
+		&cli.StringFlag{
+			Name:    "azblob.client_secret",
+			Value:   "",
+			Usage:   "The Azure blob storage client secret key to use when using azblob proxy backend. " + azBlobAuthMsg(azblobproxy.AuthMethodClientSecret),
+			EnvVars: []string{"BAZEL_REMOTE_AZBLOB_SECRET_CLIENT_SECRET", "AZURE_CLIENT_SECRET"},
+		},
+		&cli.StringFlag{
+			Name:    "azblob.cert_path",
+			Value:   "",
+			Usage:   "Path to the certificates file. " + azBlobAuthMsg(azblobproxy.AuthMethodClientCertificate),
+			EnvVars: []string{"BAZEL_REMOTE_AZBLOB_CERT_PATH", "AZURE_CLIENT_CERTIFICATE_PATH"},
 		},
 		&cli.BoolFlag{
 			Name:        "disable_http_ac_validation",
@@ -266,6 +502,12 @@ func GetCliFlags() []cli.Flag {
 			EnvVars:     []string{"BAZEL_REMOTE_ENABLE_ENDPOINT_METRICS"},
 		},
 		&cli.BoolFlag{
+			Name:        "http_metrics_prefix",
+			Usage:       "Whether to prefix http metrics with \"bazel_remote\" or not",
+			DefaultText: "false, ie no prefix",
+			EnvVars:     []string{"BAZEL_REMOTE_HTTP_METRICS_PREFIX"},
+		},
+		&cli.BoolFlag{
 			Name:        "experimental_remote_asset_api",
 			Usage:       "Whether to enable the experimental remote asset API implementation.",
 			DefaultText: "false, ie disable remote asset API",
@@ -277,6 +519,13 @@ func GetCliFlags() []cli.Flag {
 			Value:       "all",
 			DefaultText: "all, ie enable full access logging",
 			EnvVars:     []string{"BAZEL_REMOTE_ACCESS_LOG_LEVEL"},
+		},
+		&cli.StringFlag{
+			Name:        "log_timezone",
+			Usage:       "The timezone to use for log timestamps. If supplied, must be one of \"UTC\", \"local\" or \"none\" for no timestamps.",
+			Value:       "UTC",
+			DefaultText: "UTC, ie use UTC timezone",
+			EnvVars:     []string{"BAZEL_REMOTE_LOG_TIMEZONE"},
 		},
 	}
 }

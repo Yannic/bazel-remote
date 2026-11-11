@@ -91,8 +91,8 @@ func TestHelpPrinter(t *testing.T) {
 
 	// Setting an environment variable in a test is not great, but we
 	// don't have a better way to unit test this at the moment.
-	os.Setenv("COLUMNS", "35")
-	defer os.Unsetenv("COLUMNS")
+	_ = os.Setenv("COLUMNS", "35")
+	defer func() { _ = os.Unsetenv("COLUMNS") }()
 
 	flags := []cli.Flag{
 		&cli.StringFlag{
@@ -125,8 +125,7 @@ OPTIONS:
       enough to test the wrapping
       (default: 1) [$BAR]
 
-   --help, -h show help
-      (default: false)
+   --help, -h  show help
 `
 
 	output := new(bytes.Buffer)
